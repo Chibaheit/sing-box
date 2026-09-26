@@ -1,0 +1,60 @@
+{
+  "schema": 1,
+  "core": {
+    "repository": "https://github.com/Chibaheit/sing-box.git",
+    "revision": "4a39ff496a245e1864cdbe608cab09f5d17df9bc",
+    "patches": ["patches/core/0001-enable-gvisor.patch"]
+  },
+  "app": {
+    "repository": "https://github.com/SagerNet/sing-box-for-android.git",
+    "revision": "a3668ae6e4bbcb3ceff8461d0cac55d79edf504f",
+    "path": "clients/android",
+    "patches": [
+      "patches/app/0001-build-identity.patch",
+      "patches/app/0002-disable-upstream-updates.patch",
+      "patches/app/0003-vpn-protection.patch"
+    ],
+    "upstream_version": "1.14.1",
+    "version_name": "1.14.1-chibaheit.1",
+    "version_code": 734,
+    "application_id": "io.chibaheit.sfa",
+    "namespace": "io.nekohasekai.sfa",
+    "label": "Chibaheit SFA",
+    "abi": "arm64-v8a",
+    "gradle_task": ":app:assembleOtherDebug"
+  },
+  "toolchain": {
+    "go": "1.26.8",
+    "core_minimum_go": "1.25.5",
+    "java": "17",
+    "java_distribution": "temurin",
+    "gradle": "9.7.0",
+    "gradle_sha256": "84fbba45c7f4c64abc77460e1c00f541e9f960e3c7ed2538f1ede19eacd873ae",
+    "agp": "9.3.1",
+    "kotlin": "2.4.10",
+    "android_platform": "android-37.1",
+    "additional_platform": "android-36",
+    "build_tools": "37.0.0",
+    "ndk": "28.0.13004108",
+    "cmdline_tools": "12266719",
+    "gomobile": "v0.1.13",
+    "gomobile_revision": "9f03b8f25789099c5c8abef4a02085da783ba923"
+  },
+  "libbox": {
+    "command": ["go", "run", "./cmd/internal/build_libbox", "-target", "android", "-platform", "android/arm64"],
+    "local_version_tag": "v1.14.1-chibaheit.1",
+    "main_android_api": 24,
+    "legacy_android_api": 21,
+    "tags": [
+      "with_gvisor", "with_quic", "with_wireguard", "with_utls",
+      "with_naive_outbound", "with_clash_api", "with_usbip", "with_openvpn",
+      "with_openconnect", "badlinkname", "tfogo_checklinkname0", "with_tailscale",
+      "ts_omit_logtail", "ts_omit_ssh", "ts_omit_drive", "ts_omit_taildrop",
+      "ts_omit_webclient", "ts_omit_doctor", "ts_omit_capture", "ts_omit_kube",
+      "ts_omit_aws", "ts_omit_synology", "ts_omit_bird"
+    ],
+    "legacy_excluded_tags": ["with_naive_outbound"]
+  },
+  "signing": "Ephemeral runner-generated Android debug key; not a stable distribution identity",
+  "device": "Galaxy Fold6; arm64-v8a candidate, actual OS and supported ABIs require adb verification"
+}

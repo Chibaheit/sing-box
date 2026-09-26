@@ -1,0 +1,32 @@
+diff --git a/app/src/main/java/io/nekohasekai/sfa/bg/VPNService.kt b/app/src/main/java/io/nekohasekai/sfa/bg/VPNService.kt
+index fad2b8f..e881ad3 100644
+--- a/app/src/main/java/io/nekohasekai/sfa/bg/VPNService.kt
++++ b/app/src/main/java/io/nekohasekai/sfa/bg/VPNService.kt
+@@ -16,6 +16,7 @@ import io.nekohasekai.sfa.ktx.toList
+ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.runBlocking
+ import kotlinx.coroutines.withContext
++import java.io.IOException
+ 
+ class VPNService :
+     VpnService(),
+@@ -49,7 +50,9 @@ class VPNService :
+     }
+ 
+     override fun autoDetectInterfaceControl(fd: Int) {
+-        protect(fd)
++        if (!protect(fd)) {
++            throw IOException("Android VPN socket protection failed")
++        }
+     }
+ 
+     var systemProxyAvailable = false
+@@ -60,7 +63,7 @@ class VPNService :
+ 
+         val builder =
+             Builder()
+-                .setSession("sing-box")
++                .setSession(getString(io.nekohasekai.sfa.R.string.app_name))
+                 .setMtu(options.mtu)
+ 
+         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
