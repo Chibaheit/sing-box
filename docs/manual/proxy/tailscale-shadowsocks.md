@@ -25,9 +25,15 @@ No second client binary or new protocol implementation is needed.
 
 The fork's `build-2-1` release provides CLI archives for Linux, macOS, and Windows,
 each for amd64 and arm64. Choose the matching archive and verify it against
-the release's `SHA256SUMS`. These are not mobile/GUI packages. Use this fork's
-schema: the example uses `http_clients`, rule-set `http_client`, and Tailscale
-DNS `accept_search_domain`, not deprecated `download_detour`.
+the release's `SHA256SUMS`. These are not mobile/GUI packages. The example is
+also schema-compatible with official core **1.14.2** built with `with_tailscale`;
+`http_clients`, rule-set `http_client`, Tailscale DNS `accept_search_domain` and
+DNS `preferred_by` are supported in 1.14, and route `preferred_by` in 1.13.
+These are not fork-only fields and do not require 1.15. The example does not
+use deprecated `download_detour`.
+
+For Android VPN capture rather than this opt-in CLI listener, use the separate
+[SFA 1.14.2 profile and setup guide](tailscale-shadowsocks-android-1.14.2.md).
 
 From the repository root, with a verified native binary:
 
@@ -40,7 +46,11 @@ python3 .github/check-tailscale-shadowsocks.py --binary /path/to/sing-box
 `version` must report `with_tailscale`. `check` constructs and closes the
 configuration without starting services, logging in, resolving placeholders,
 downloading remote rules, or creating runtime state. Therefore it validates
-schema and construction-time references, **not rule contents or connectivity**. The Python
+schema and construction-time references, **not rule contents or connectivity**.
+In particular, rule-set HTTP-client tags are resolved at startup: `check` can
+accept a nonexistent tag. The separate Android checker also statically validates
+the tag references in both examples; do not treat schema checking as complete
+reference validation. The Python
 standard-library checks assert exact policy/order, private DNS guards,
 an RFC 3849 documentation-only IPv6 proxy literal without a proxy DNS resolver,
 unchanged dual-stack target DNS strategy, proxy-only rule downloads, and persistent cache.
