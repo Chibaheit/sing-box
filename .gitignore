@@ -8,7 +8,9 @@
 /dist/
 /sing-box
 /sing-box.exe
-/build/
+/build/*
+!/build/android/
+/build/android/__pycache__/
 /*.jar
 /*.aar
 /*.xcframework/
