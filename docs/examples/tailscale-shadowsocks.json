@@ -1,0 +1,181 @@
+{
+  "dns": {
+    "servers": [
+      {
+        "type": "tailscale",
+        "tag": "tailnet-dns",
+        "endpoint": "tailnet",
+        "accept_default_resolvers": false,
+        "accept_search_domain": true
+      },
+      {
+        "type": "udp",
+        "tag": "cn-dns",
+        "server": "223.5.5.5",
+        "server_port": 53
+      },
+      {
+        "type": "https",
+        "tag": "external-dns",
+        "server": "1.1.1.1",
+        "server_port": 443,
+        "path": "/dns-query",
+        "tls": {
+          "enabled": true,
+          "server_name": "cloudflare-dns.com"
+        },
+        "detour": "shadowsocks"
+      }
+    ],
+    "rules": [
+      {
+        "preferred_by": "tailnet-dns",
+        "action": "route",
+        "server": "tailnet-dns"
+      },
+      {
+        "type": "logical",
+        "mode": "or",
+        "rules": [
+          {
+            "domain_suffix": ["ts.net"]
+          },
+          {
+            "domain_regex": ["^[^.]+\\.?$"]
+          }
+        ],
+        "action": "route",
+        "server": "tailnet-dns"
+      },
+      {
+        "domain_suffix": [
+          "local",
+          "lan",
+          "home.arpa",
+          "internal",
+          "in-addr.arpa",
+          "ip6.arpa"
+        ],
+        "action": "reject"
+      },
+      {
+        "rule_set": ["geosite-cn"],
+        "action": "route",
+        "server": "cn-dns"
+      }
+    ],
+    "final": "external-dns",
+    "strategy": "prefer_ipv4"
+  },
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "local-proxy",
+      "listen": "127.0.0.1",
+      "listen_port": 2080,
+      "set_system_proxy": false
+    }
+  ],
+  "endpoints": [
+    {
+      "type": "tailscale",
+      "tag": "tailnet",
+      "state_directory": "./private-state/tailscale",
+      "hostname": "sing-box-local-proxy",
+      "system_interface": false,
+      "accept_routes": false,
+      "advertise_routes": [],
+      "advertise_exit_node": false
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "shadowsocks",
+      "tag": "shadowsocks",
+      "server": "2001:db8::1",
+      "server_port": 8388,
+      "method": "chacha20-ietf-poly1305",
+      "password": "INSECURE-EXAMPLE-ONLY-REPLACE-ME"
+    },
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "http_clients": [
+    {
+      "tag": "rule-download",
+      "detour": "shadowsocks"
+    }
+  ],
+  "experimental": {
+    "cache_file": {
+      "enabled": true,
+      "path": "./private-state/cache.db"
+    }
+  },
+  "route": {
+    "rules": [
+      {
+        "inbound": ["tailnet"],
+        "action": "reject"
+      },
+      {
+        "inbound": ["local-proxy"],
+        "port": [53],
+        "action": "hijack-dns"
+      },
+      {
+        "action": "resolve"
+      },
+      {
+        "preferred_by": "tailnet",
+        "action": "route",
+        "outbound": "tailnet"
+      },
+      {
+        "ip_cidr": [
+          "100.64.0.0/10",
+          "fd7a:115c:a1e0::/48"
+        ],
+        "action": "route",
+        "outbound": "tailnet"
+      },
+      {
+        "ip_is_private": true,
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "rule_set": ["geosite-cn"],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "rule_set": ["geoip-cn"],
+        "action": "route",
+        "outbound": "direct"
+      }
+    ],
+    "rule_set": [
+      {
+        "type": "remote",
+        "tag": "geosite-cn",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs",
+        "http_client": "rule-download",
+        "update_interval": "1d"
+      },
+      {
+        "type": "remote",
+        "tag": "geoip-cn",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs",
+        "http_client": "rule-download",
+        "update_interval": "1d"
+      }
+    ],
+    "final": "shadowsocks",
+    "default_domain_resolver": "cn-dns"
+  }
+}

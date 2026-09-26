@@ -71,6 +71,8 @@ nav:
       - Proxy:
           - Server: manual/proxy/server.md
           - Client: manual/proxy/client.md
+          - China direct, Shadowsocks and Tailscale: manual/proxy/tailscale-shadowsocks.md
+          - Android SFA 1.14.2, Shadowsocks and Tailscale: manual/proxy/tailscale-shadowsocks-android-1.14.2.md
       #          - TUN: manual/proxy/tun.md
       - Proxy Protocol:
           - Shadowsocks: manual/proxy-protocol/shadowsocks.md
