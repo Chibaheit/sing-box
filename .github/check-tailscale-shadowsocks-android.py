@@ -17,8 +17,10 @@ ROOT = Path(__file__).resolve().parents[1]
 EXAMPLE = ROOT / "docs/examples/tailscale-shadowsocks-android-1.14.2.json"
 TARGET_VERSION = "1.14.2"
 TARGET_REVISION = "af6e64c3b69e6132ebaee0e1a3d24e93903f6709"
+ANDROID_REVISION = "fc21909df7a3f0fc9435f3866fb6a4960711aa5f"
 BINARY = None
 FORK_BINARY = None
+SOURCE_REPOSITORY = None
 spec = importlib.util.spec_from_file_location(
     "cli_policy", ROOT / ".github/check-tailscale-shadowsocks.py",
 )
@@ -110,9 +112,12 @@ class AndroidTests(unittest.TestCase):
             "type", "tag", "state_directory", "hostname", "system_interface",
             "accept_routes", "advertise_routes", "advertise_exit_node",
         }, "no endpoint chaining, auth key or exit node")
+        self.assertIs(config["route"].get("auto_detect_interface"), True,
+                      "Android socket protection requires route.auto_detect_interface=true")
 
         # Reuse the unchanged CLI policy oracle only after checking every Android delta.
         normalized = copy.deepcopy(config)
+        del normalized["route"]["auto_detect_interface"]
         normalized["inbounds"] = [{
             "type": "mixed", "tag": "local-proxy", "listen": "127.0.0.1",
             "listen_port": 2080, "set_system_proxy": False,
@@ -125,6 +130,93 @@ class AndroidTests(unittest.TestCase):
 
     def test_android_policy(self):
         self.assert_policy(self.config)
+
+    def test_android_socket_protection_required(self):
+        self.assertIs(self.config["route"].get("auto_detect_interface"), True,
+                      "Android socket protection requires route.auto_detect_interface=true")
+
+    def test_android_socket_protection_regressions(self):
+        for value in (None, False, 0, 1, "true"):
+            with self.subTest(value=value):
+                invalid = copy.deepcopy(self.config)
+                if value is None:
+                    invalid["route"].pop("auto_detect_interface", None)
+                else:
+                    invalid["route"]["auto_detect_interface"] = value
+                with self.assertRaisesRegex(AssertionError, "Android socket protection"):
+                    self.assert_policy(invalid)
+
+    def test_android_normalization_preserves_extra_route_keys(self):
+        self.assert_policy(self.config)
+        for key, value in (("not_a_route_option", True), ("default_interface", "eth0")):
+            with self.subTest(key=key):
+                invalid = copy.deepcopy(self.config)
+                invalid["route"][key] = value
+                with self.assertRaises(AssertionError):
+                    self.assert_policy(invalid)
+
+    def test_pinned_source_android_callback_path(self):
+        """Structural source assertions only; no compiled core or Android execution."""
+        if SOURCE_REPOSITORY is None:
+            self.skipTest("supply --source-repository with pinned core and SFA Git objects "
+                          "for structural callback-path coverage (not a device test)")
+
+        def git(*args):
+            result = subprocess.run(
+                ["git", "--no-replace-objects", "-C", str(SOURCE_REPOSITORY),
+                 *args],
+                capture_output=True, text=True, timeout=30, check=True,
+            )
+            return result.stdout.strip()
+
+        def source(path, revision=TARGET_REVISION):
+            return " ".join(git("show", f"{revision}:{path}").split())
+
+        self.assertEqual(git("rev-parse", f"{TARGET_REVISION}:clients/android"),
+                         ANDROID_REVISION)
+        self.assertIn('AutoDetectInterface bool `json:"auto_detect_interface,omitempty"`',
+                      source("option/route.go"))
+        self.assertIn("const IsAndroid = 1", source("constant/goos/zgoos_android.go"))
+        self.assertIn("const IsLinux = goos.IsLinux == 1 || goos.IsAndroid == 1",
+                      source("constant/os.go"))
+        network = source("route/network.go")
+        self.assertIn("if options.AutoDetectInterface && "
+                      "!(C.IsLinux || C.IsDarwin || C.IsWindows)", network)
+        self.assertIn("autoDetectInterface: options.AutoDetectInterface,", network)
+        self.assertIn("func (r *NetworkManager) AutoDetectInterface() bool "
+                      "{ return r.autoDetectInterface }", network)
+        dialer = source("common/dialer/default.go")
+        gate = "} else if networkManager.AutoDetectInterface() && !disableDefaultBind {"
+        self.assertIn(gate, dialer)
+        android_branch = dialer.split(gate, 1)[1].split("} else {", 1)[0]
+        self.assertTrue(android_branch.startswith(
+            " if platformInterface != nil && platformInterface.UsePlatformNetworkInterfaces() {"))
+        self.assertIn(
+            "bindFunc := networkManager.ProtectFunc() "
+            "dialer.Control = control.Append(dialer.Control, bindFunc) "
+            "listener.Control = control.Append(listener.Control, bindFunc)", android_branch,
+            "both ordinary TCP dialer and UDP listener must install protection inside the gate")
+        self.assertIn(
+            "func (r *NetworkManager) ProtectFunc() control.Func { "
+            "if r.platformInterface != nil && "
+            "r.platformInterface.UsePlatformAutoDetectInterfaceControl() { "
+            "return func(network, address string, conn syscall.RawConn) error { "
+            "return control.Raw(conn, func(fd uintptr) error { "
+            "return r.platformInterface.AutoDetectInterfaceControl(int(fd)) "
+            "}) } } return nil }", network)
+        bridge = source("experimental/libbox/service.go")
+        self.assertIn("func (w *platformInterfaceWrapper) UsePlatformNetworkInterfaces() "
+                      "bool { return true }", bridge)
+        self.assertIn("func (w *platformInterfaceWrapper) UsePlatformAutoDetectInterfaceControl() "
+                      "bool { return w.iif.UsePlatformAutoDetectInterfaceControl() }", bridge)
+        self.assertIn("func (w *platformInterfaceWrapper) AutoDetectInterfaceControl(fd int) "
+                      "error { return w.iif.AutoDetectInterfaceControl(int32(fd)) }", bridge)
+        app_path = "app/src/main/java/io/nekohasekai/sfa/bg/"
+        self.assertIn("override fun usePlatformAutoDetectInterfaceControl(): Boolean = true",
+                      source(app_path + "PlatformInterfaceWrapper.kt", ANDROID_REVISION))
+        vpn = source(app_path + "VPNService.kt", ANDROID_REVISION)
+        self.assertIn("class VPNService : VpnService(), PlatformInterfaceWrapper", vpn)
+        self.assertIn("override fun autoDetectInterfaceControl(fd: Int) { protect(fd) }", vpn)
 
     def test_all_references(self):
         for path in (EXAMPLE, cli_policy.EXAMPLE):
@@ -285,10 +377,14 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, help="official native core 1.14.2 binary")
     parser.add_argument("--fork-binary", type=Path, help="optional existing fork CLI binary")
+    parser.add_argument("--source-repository", type=Path,
+                        help="Git repository containing pinned core and SFA commits; "
+                             "structural checks only, no checkout or runtime execution")
     args = parser.parse_args()
     for binary in (args.binary, args.fork_binary):
         if binary is not None and not binary.is_file():
             parser.error(f"binary does not exist: {binary}")
     BINARY = args.binary.resolve() if args.binary else None
     FORK_BINARY = args.fork_binary.resolve() if args.fork_binary else None
+    SOURCE_REPOSITORY = args.source_repository.resolve() if args.source_repository else None
     unittest.main(argv=[__file__], verbosity=2)

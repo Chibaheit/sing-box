@@ -88,10 +88,23 @@ addresses, not server or tailnet addresses. No mixed listener, fixed
 settings or blanket app exclusion is added.
 
 Do **not** blanket-exclude tailnet ranges from TUN: captured tailnet traffic
-must reach the embedded endpoint. SFA's pinned
+must reach the embedded endpoint. **Keep `route.auto_detect_interface: true`.**
+In the pinned core, this boolean defaults to false; the
+[`NetworkManager`](https://github.com/SagerNet/sing-box/blob/af6e64c3b69e6132ebaee0e1a3d24e93903f6709/route/network.go)
+passes it to the
+[`default dialer`'s callback gate](https://github.com/SagerNet/sing-box/blob/af6e64c3b69e6132ebaee0e1a3d24e93903f6709/common/dialer/default.go#L105-L130).
+With SFA's platform interface, enabling it installs `ProtectFunc()` on both
+the ordinary TCP dialer and UDP listener. The libbox platform callback reaches
+SFA's pinned
 [`VPNService.kt`](https://github.com/SagerNet/sing-box-for-android/blob/fc21909df7a3f0fc9435f3866fb6a4960711aa5f/app/src/main/java/io/nekohasekai/sfa/bg/VPNService.kt)
-uses Android `protect(fd)` for outbound socket loop avoidance, not bypass
-routes for all tailnet destinations.
+`protect(fd)` for outbound socket loop avoidance. Without this flag, ordinary
+Shadowsocks, direct and DNS sockets can be captured back into the VPN;
+Tailscale's separate netns protection does not protect those sockets.
+This is Android's socket-protection callback, **not a fixed desktop interface
+binding**: do not add `default_interface` or `bind_interface`, or bypass routes
+for all tailnet destinations. The core's
+[`C.IsLinux` constant includes Android](https://github.com/SagerNet/sing-box/blob/af6e64c3b69e6132ebaee0e1a3d24e93903f6709/constant/os.go#L23),
+so the route option's Linux platform gate does not exclude SFA.
 
 | Order | Match/action |
 | --- | --- |
@@ -163,6 +176,26 @@ python3 .github/check-tailscale-shadowsocks.py --binary /path/to/sing-box-1.14.2
 Optionally add `--fork-binary /path/to/fork/sing-box` to the Android checker
 and rerun the unchanged CLI checker against that binary. Without binary
 arguments the corresponding binary tests are explicitly skipped.
+For **pinned-source structural callback-path coverage**, use a Git repository
+containing both pinned commits (no checkout, build, APK or device execution):
+
+```sh
+git -C /path/to/source-repository fetch --no-tags --recurse-submodules=no \
+  https://github.com/SagerNet/sing-box.git af6e64c3b69e6132ebaee0e1a3d24e93903f6709
+git -C /path/to/source-repository fetch --no-tags --recurse-submodules=no \
+  https://github.com/SagerNet/sing-box-for-android.git fc21909df7a3f0fc9435f3866fb6a4960711aa5f
+python3 .github/check-tailscale-shadowsocks-android.py \
+  --binary /path/to/sing-box-1.14.2 --source-repository /path/to/source-repository
+```
+
+The source test reads the pinned Git objects, not working-tree files. It checks
+the core/app submodule pin, boolean option and Android/Linux gate, the flag-gated
+TCP/UDP control installation, `ProtectFunc`, libbox forwarding and SFA's
+`protect(fd)` callback. It is skipped explicitly without `--source-repository`;
+missing objects or mismatched source fail rather than silently skip.
+This is structural evidence, not a compiled unit test or proof of protection
+on a running phone. Native `sing-box check` alone cannot verify this callback.
+
 The existing fork CLI `dev-4a39ff496a24` (revision
 `4a39ff496a245e1864cdbe608cab09f5d17df9bc`, `go1.25.5 linux/amd64`, CGO disabled)
 passes construction checks but **does not contain `with_gvisor`**; it is not
@@ -178,10 +211,14 @@ checks cover endpoint, DNS, route, rule-set, HTTP-client and detour references
 in both examples, including nested rules. **`sing-box check` accepts a dangling
 rule-set HTTP-client tag** because transport lookup is deferred until startup;
 the independent negative-reference tests reject it. Other regressions cover
-missing `auto_route`, wrong DNS hijack inbound, tailnet IPv6 order, final direct,
+missing/false/non-boolean `route.auto_detect_interface`, missing `auto_route`,
+wrong DNS hijack inbound, tailnet IPv6 order, final direct,
 IPv4 proxy transport, state/cache paths and private DNS guards. These are
 documentation fixture tests: they deliberately require the restricted example
 IPv6 address and public password, not users' substituted production values.
+Only the verified `auto_detect_interface: true` route delta is removed before
+the unchanged CLI oracle runs; arbitrary extra route keys and fixed desktop
+interface binding remain rejected.
 
 Keep this layer limited to the separate JSON, checker, guide and navigation;
 the CLI JSON and its 22 tests remain unchanged. Core and Android source pins
