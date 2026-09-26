@@ -6,6 +6,8 @@ LAN/private destinations and mainland China domain/IP matches go `direct`, and
 **overseas/unmatched destinations use Shadowsocks**. Tailscale and Shadowsocks
 are independent: neither protocol outbound has a `detour` through the other.
 Only encrypted public DNS and rule downloads explicitly detour through Shadowsocks.
+**IPv6 is the primary client-to-Shadowsocks-server transport**, not a requirement
+that target websites be IPv6-only.
 
 This is an **application opt-in proxy**, not a system-wide VPN, a geography
 oracle, or a firewall/privacy kill switch. The unauthenticated mixed HTTP/SOCKS
@@ -40,9 +42,12 @@ configuration without starting services, logging in, resolving placeholders,
 downloading remote rules, or creating runtime state. Therefore it validates
 schema and construction-time references, **not rule contents or connectivity**. The Python
 standard-library checks assert exact policy/order, private DNS guards,
-nonrecursive proxy bootstrap, proxy-only rule downloads, and persistent cache.
+an RFC 3849 documentation-only IPv6 proxy literal without a proxy DNS resolver,
+unchanged dual-stack target DNS strategy, proxy-only rule downloads, and persistent cache.
 Negative mutations include direct-final, missing tailnet IPv6, private-before-
 tailnet order, missing resolve/ingress rejection, and DNS/download bypasses.
+They also reject IPv4/hostname/bracketed/mapped/loopback/unspecified/scoped or
+non-documentation proxy addresses, IPv6-only target DNS, and direct fallback.
 The binary tests also require unknown schema fields to fail.
 Omit `--binary` for policy-only checks; binary checks are explicitly skipped.
 
@@ -52,17 +57,35 @@ is changed here; the existing six-platform release matrix remains unchanged.
 ## Replace placeholders and provide private persistent storage
 
 Copy the JSON outside the checkout into a private configuration directory.
-Replace `proxy.example`, port `8388`, cipher, and password with your authorized
-Shadowsocks settings. `.example` is reserved and is not a working server.
+Replace `2001:db8::1` with your authorized Shadowsocks server's reachable **IPv6
+address**. This literal is reserved for documentation by RFC 3849
+(`2001:db8::/32`), not a working server or the user's address. Keep `server` a
+bare IPv6 literal: no brackets, zone identifier, or appended port. The separate
+`server_port: 8388`, `method: chacha20-ietf-poly1305`, and password are
+**illustrative placeholders, not the user's settings**; replace them with the
+server's actual port, cipher, and password.
 `INSECURE-EXAMPLE-ONLY-REPLACE-ME` is a format-valid, public, test-only password
 for `chacha20-ietf-poly1305`, **not a credential to deploy**. A 2022 cipher
 instead needs its correctly sized base64 key.
 
-The strongest bootstrap option is your real Shadowsocks server's IP address.
-If you retain a hostname, its explicit `domain_resolver: cn-dns` uses domestic
-UDP DNS directly, avoiding encrypted DNS -> Shadowsocks -> encrypted DNS
-recursion. The route's `default_domain_resolver: cn-dns` is also explicit, but
+The literal Shadowsocks server needs **no proxy-server DNS lookup**, so the
+outbound intentionally omits `domain_resolver`. `cn-dns` remains in use for
+domestic domain queries and, via `route.default_domain_resolver`, direct
+control-plane hostname resolution such as Tailscale control/DERP. That default
 does not replace the pre-routing `resolve` action or the DNS rules.
+
+The client needs working IPv6 connectivity to the real Shadowsocks server,
+including its configured port and the transports you intend to use. Tailnet
+membership alone does **not** supply this Internet IPv6 connectivity, and
+Shadowsocks is not routed through Tailscale here. There is no configured IPv4
+backup server and no direct fallback if Shadowsocks or client IPv6 is unavailable.
+
+This IPv6 transport still supports **IPv4 target websites if the Shadowsocks
+server has working IPv4 egress**; IPv6 targets similarly need suitable server
+egress. Keep the global `dns.strategy: prefer_ipv4`: it controls target address
+preference, not the family of the literal Shadowsocks transport. It still permits
+IPv6 answers and does not make target websites IPv6-only. The example's IPv4
+DoH destination also relies on server-side IPv4 egress through Shadowsocks.
 
 Set both `endpoints[0].state_directory` and `experimental.cache_file.path` to
 private, persistent, writable deployment paths **outside the checkout**.

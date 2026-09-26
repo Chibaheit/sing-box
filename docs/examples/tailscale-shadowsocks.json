@@ -92,11 +92,10 @@
     {
       "type": "shadowsocks",
       "tag": "shadowsocks",
-      "server": "proxy.example",
+      "server": "2001:db8::1",
       "server_port": 8388,
       "method": "chacha20-ietf-poly1305",
-      "password": "INSECURE-EXAMPLE-ONLY-REPLACE-ME",
-      "domain_resolver": "cn-dns"
+      "password": "INSECURE-EXAMPLE-ONLY-REPLACE-ME"
     },
     {
       "type": "direct",

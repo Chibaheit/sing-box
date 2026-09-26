@@ -3,6 +3,7 @@
 
 import argparse
 import copy
+import ipaddress
 import json
 from pathlib import Path
 import re
@@ -51,6 +52,21 @@ class ExampleTests(unittest.TestCase):
         self.assertTrue(EXAMPLE.is_file(), f"missing combined example: {EXAMPLE}")
         self.config = json.loads(EXAMPLE.read_text(encoding="utf-8"))
 
+    def assert_example_ipv6_server(self, server):
+        message = "Shadowsocks server must be a bare RFC 3849 documentation IPv6 literal"
+        self.assertIsInstance(server, str, message)
+        self.assertNotIn("%", server, message)
+        try:
+            address = ipaddress.ip_address(server)
+        except ValueError as error:
+            self.fail(f"{message}: {error}")
+        self.assertIsInstance(address, ipaddress.IPv6Address, message)
+        self.assertIsNone(address.ipv4_mapped, message)
+        self.assertFalse(address.is_loopback, message)
+        self.assertFalse(address.is_unspecified, message)
+        self.assertIn(address, ipaddress.ip_network("2001:db8::/32"), message)
+        self.assertEqual(server, "2001:db8::1", message)
+
     def assert_policy(self, config):
         self.assertEqual(config["route"]["final"], "shadowsocks",
                          "overseas/unmatched traffic must default to Shadowsocks")
@@ -78,12 +94,12 @@ class ExampleTests(unittest.TestCase):
         self.assertEqual(outbounds["direct"], {"type": "direct", "tag": "direct"})
         proxy = outbounds["shadowsocks"]
         self.assertEqual(proxy["type"], "shadowsocks")
-        self.assertEqual(proxy["server"], "proxy.example")
+        self.assert_example_ipv6_server(proxy["server"])
         self.assertEqual(proxy["server_port"], 8388)
         self.assertEqual(proxy["method"], "chacha20-ietf-poly1305")
         self.assertEqual(proxy["password"], "INSECURE-EXAMPLE-ONLY-REPLACE-ME")
-        self.assertEqual(proxy["domain_resolver"], "cn-dns",
-                         "proxy bootstrap must not recursively use encrypted DNS through itself")
+        self.assertNotIn("domain_resolver", proxy,
+                         "literal proxy server needs no DNS resolver")
         for item in [endpoint, *config["outbounds"]]:
             self.assertNotIn("detour", item, "Tailscale and Shadowsocks must not be chained")
         self.assertEqual(config["dns"]["servers"], [
@@ -98,11 +114,12 @@ class ExampleTests(unittest.TestCase):
                 "tls": {"enabled": True, "server_name": "cloudflare-dns.com"},
                 "detour": "shadowsocks",
             },
-        ], "encrypted DNS must use Shadowsocks with an IP bootstrap")
+        ], "encrypted DNS must use Shadowsocks with a literal DoH server")
         self.assertEqual(config["dns"]["rules"], DNS_RULES,
                          "dynamic tailnet DNS and private-name guards must precede public DNS")
         self.assertEqual(config["dns"]["final"], "external-dns")
-        self.assertEqual(config["dns"]["strategy"], "prefer_ipv4")
+        self.assertEqual(config["dns"]["strategy"], "prefer_ipv4",
+                         "target DNS family strategy must remain dual-stack prefer_ipv4")
         self.assertEqual(set(config["dns"]), {"servers", "rules", "final", "strategy"})
         self.assertEqual(config["http_clients"], [{"tag": "rule-download", "detour": "shadowsocks"}],
                          "rule downloads must use Shadowsocks")
@@ -124,6 +141,35 @@ class ExampleTests(unittest.TestCase):
 
     def test_example_policy(self):
         self.assert_policy(self.config)
+
+    def test_shadowsocks_server_is_documentation_ipv6_literal(self):
+        self.assert_example_ipv6_server(self.config["outbounds"][0]["server"])
+
+    def test_invalid_shadowsocks_servers_are_rejected(self):
+        for server in (
+            "192.0.2.1", "proxy.example", "[2001:db8::1]", "[2001:db8::1]:8388",
+            "::ffff:192.0.2.1", "::1", "::", "2001:db8::1%eth0", "fe80::1",
+            "fd7a:115c:a1e0::1", "2606:4700:4700::1111", "2001:db9::1",
+            "2001:db8::1:8388", "", None,
+        ):
+            with self.subTest(server=server):
+                invalid = copy.deepcopy(self.config)
+                invalid["outbounds"][0]["server"] = server
+                with self.assertRaisesRegex(AssertionError, "bare RFC 3849"):
+                    self.assert_policy(invalid)
+
+    def test_ipv6_only_targets_are_rejected(self):
+        self.config["dns"]["strategy"] = "ipv6_only"
+        with self.assertRaisesRegex(AssertionError, "target DNS family strategy"):
+            self.assert_policy(self.config)
+
+    def test_direct_fallback_selector_is_rejected(self):
+        self.config["outbounds"].append({
+            "type": "selector", "tag": "fallback", "outbounds": ["shadowsocks", "direct"],
+        })
+        self.config["route"]["final"] = "fallback"
+        with self.assertRaisesRegex(AssertionError, "default to Shadowsocks"):
+            self.assert_policy(self.config)
 
     def test_missing_tailnet_ipv6_is_rejected(self):
         self.config["route"]["rules"][4]["ip_cidr"].remove("fd7a:115c:a1e0::/48")
@@ -174,10 +220,13 @@ class ExampleTests(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "encrypted DNS"):
             self.assert_policy(self.config)
 
-    def test_recursive_proxy_dns_is_rejected(self):
-        self.config["outbounds"][0]["domain_resolver"] = "external-dns"
-        with self.assertRaisesRegex(AssertionError, "proxy bootstrap"):
-            self.assert_policy(self.config)
+    def test_unneeded_proxy_dns_is_rejected(self):
+        for resolver in ("cn-dns", "external-dns"):
+            with self.subTest(resolver=resolver):
+                invalid = copy.deepcopy(self.config)
+                invalid["outbounds"][0]["domain_resolver"] = resolver
+                with self.assertRaisesRegex(AssertionError, "literal proxy server needs no DNS"):
+                    self.assert_policy(invalid)
 
     def test_direct_rule_downloads_is_rejected(self):
         self.config["http_clients"][0]["detour"] = "direct"
