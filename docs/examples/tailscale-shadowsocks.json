@@ -1,0 +1,66 @@
+{
+  "dns": {
+    "servers": [
+      {
+        "type": "local",
+        "tag": "local"
+      }
+    ]
+  },
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "local-proxy",
+      "listen": "127.0.0.1",
+      "listen_port": 2080,
+      "set_system_proxy": false
+    }
+  ],
+  "endpoints": [
+    {
+      "type": "tailscale",
+      "tag": "tailnet",
+      "state_directory": "./tailscale-state",
+      "hostname": "sing-box-local-proxy",
+      "system_interface": false,
+      "accept_routes": false,
+      "advertise_routes": [],
+      "advertise_exit_node": false
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "shadowsocks",
+      "tag": "shadowsocks",
+      "server": "proxy.example",
+      "server_port": 8388,
+      "method": "chacha20-ietf-poly1305",
+      "password": "INSECURE-EXAMPLE-ONLY-REPLACE-ME"
+    },
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "rules": [
+      {
+        "ip_cidr": [
+          "100.64.0.0/10",
+          "fd7a:115c:a1e0::/48"
+        ],
+        "action": "route",
+        "outbound": "tailnet"
+      },
+      {
+        "domain": [
+          "selected.example"
+        ],
+        "action": "route",
+        "outbound": "shadowsocks"
+      }
+    ],
+    "final": "direct",
+    "default_domain_resolver": "local"
+  }
+}

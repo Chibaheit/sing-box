@@ -71,6 +71,7 @@ nav:
       - Proxy:
           - Server: manual/proxy/server.md
           - Client: manual/proxy/client.md
+          - Tailscale and Shadowsocks: manual/proxy/tailscale-shadowsocks.md
       #          - TUN: manual/proxy/tun.md
       - Proxy Protocol:
           - Shadowsocks: manual/proxy-protocol/shadowsocks.md
