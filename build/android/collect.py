@@ -13,6 +13,7 @@ import tarfile
 import zipfile
 
 from prepare import HERE, MANIFEST, git, provenance, require
+from signing import expected_certificate, sdk_tools
 
 
 def check_apk(apk, badging):
@@ -23,7 +24,7 @@ def check_apk(apk, badging):
     require(package.groups() == (app["application_id"], str(app["version_code"]), app["version_name"]),
             "APK identity/version mismatch")
     require(f"application-label:'{app['label']}'" in badging, "APK label mismatch")
-    require("application-debuggable" in badging, "Expected DEBUG trial, not release")
+    require("application-debuggable" not in badging, "Refusing debuggable release")
     native = re.search(r"^native-code: (.+)$", badging, re.MULTILINE)
     require(native is not None and re.findall(r"'([^']+)'", native[1]) == [app["abi"]],
             "APK badging must advertise only arm64-v8a")
@@ -101,6 +102,28 @@ def certificate_digest(report):
     return records[0]["certificate SHA-256 digest"]
 
 
+def release_certificate(report):
+    fingerprint = certificate_digest(report)
+    require("Verified using v2 scheme (APK Signature Scheme v2): true" in report.splitlines(),
+            "Release requires APK Signature Scheme v2, not jarsigner-only signing")
+    require(fingerprint == expected_certificate(), "Release signing certificate mismatch")
+    return fingerprint
+
+
+def public_source_path(name):
+    path = Path(name)
+    parts = {part.lower() for part in path.parts}
+    if parts & {"local.properties", "service-account-credentials.json", "signenv",
+                "tempkeys", "keystores", "chibaheit-release-signing", "__pycache__"}:
+        return False
+    if path.suffix.lower() in (".keystore", ".jks", ".p12", ".pfx", ".key", ".env"):
+        return False
+    if path.name.lower().startswith(".env"):
+        return False
+    return path.suffix.lower() != ".pem" or name in (
+        "common/certificate/chrome.pem", "common/certificate/mozilla.pem")
+
+
 def source_files(root):
     entries = git(root, "ls-tree", "-r", "HEAD").splitlines()
     result = []
@@ -108,14 +131,7 @@ def source_files(root):
         metadata, name = entry.split("\t", 1)
         if metadata.split()[1] != "blob":
             continue
-        path = Path(name)
-        if path.suffix.lower() in (".keystore", ".jks", ".p12", ".pfx", ".key"):
-            continue
-        if path.suffix.lower() == ".pem" and name not in (
-            "common/certificate/chrome.pem", "common/certificate/mozilla.pem"
-        ):
-            continue
-        if path.name in ("local.properties", "service-account-credentials.json"):
+        if not public_source_path(name):
             continue
         result.append(name)
     return result
@@ -128,51 +144,59 @@ def archive_source(root, name, output):
                     *source_files(root)], check=True)
 
 
-def collect(core, tooling, output):
+def collect(core, tooling, signed, output):
+    expected_certificate()
     record = provenance(core, tooling)
     app = core / MANIFEST["app"]["path"]
-    apks = list((app / "app/build/outputs/apk/other/debug").glob("*.apk"))
-    require(len(apks) == 1, f"Expected exactly one arm64 debug APK, found {len(apks)}")
+    apks = list(signed.glob("*.apk"))
+    require(len(apks) == 1 and apks[0].name == "release.apk" and not apks[0].is_symlink(),
+            "Expected exactly one explicitly signed release.apk")
     apk = apks[0]
-    sdk = Path(os.environ["ANDROID_HOME"]) / "build-tools" / MANIFEST["toolchain"]["build_tools"]
+    sdk = sdk_tools()
     badging = subprocess.check_output([str(sdk / "aapt"), "dump", "badging", str(apk)], text=True)
     check_apk(apk, badging)
     report = subprocess.check_output(
         [str(sdk / "apksigner"), "verify", "--verbose", "--print-certs", str(apk)], text=True)
     try:
-        fingerprint = certificate_digest(report)
+        fingerprint = release_certificate(report)
     except ValueError:
         print("Rejected public apksigner report: " + json.dumps(report, ensure_ascii=True),
               flush=True)
         raise
     output.mkdir(parents=True, exist_ok=False)
-    name = f"Chibaheit-SFA-{MANIFEST['app']['version_name']}-arm64-v8a-DEBUG.apk"
+    name = f"Chibaheit-SFA-{MANIFEST['app']['version_name']}-arm64-v8a-RELEASE.apk"
     shutil.copyfile(apk, output / name)
     (output / "certificate-sha256.txt").write_text(f"{fingerprint}  {name}\n")
     record["apk"] = name
     record["certificate_sha256"] = fingerprint
+    record["apk_sha256"] = hashlib.sha256(apk.read_bytes()).hexdigest()
+    record["debuggable"] = False
+    record["build_variant"] = "otherRelease"
     record["github_run_id"] = os.environ.get("GITHUB_RUN_ID")
     record["github_run_attempt"] = os.environ.get("GITHUB_RUN_ATTEMPT")
     record["actual_go_version"] = subprocess.check_output(["go", "version"], text=True).strip()
     record["actual_java_version"] = subprocess.check_output(["java", "--version"], text=True).strip()
     (output / "source-manifest.json").write_text(json.dumps(record, indent=2) + "\n")
     with tarfile.open(output / "source-patch-bundle.tar.gz", "w:gz") as bundle:
-        for path in sorted(HERE.rglob("*")):
-            if path.is_file() and "__pycache__" not in path.parts:
-                bundle.add(path, arcname="build/android/" + str(path.relative_to(HERE)))
+        for name in source_files(tooling):
+            if name.startswith("build/android/"):
+                path = tooling / name
+                require(path.is_file() and not path.is_symlink(), "Invalid tooling source file")
+                bundle.add(path, arcname=name)
         bundle.add(output / "source-manifest.json", arcname="source-manifest.json")
     archive_source(core, "core", output / "core-source.tar.gz")
     archive_source(app, "app", output / "app-source.tar.gz")
     lines = [f"{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.name}\n"
              for p in sorted(output.iterdir())]
     (output / "SHA256SUMS").write_text("".join(lines))
-    print(f"Verified DEBUG artifact: {output / name}")
+    print(f"Verified RELEASE artifact: {output / record['apk']}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("core", type=Path)
     parser.add_argument("tooling", type=Path)
+    parser.add_argument("signed", type=Path)
     parser.add_argument("output", type=Path)
     args = parser.parse_args()
-    collect(args.core.resolve(), args.tooling.resolve(), args.output.resolve())
+    collect(args.core.resolve(), args.tooling.resolve(), args.signed.resolve(), args.output.resolve())

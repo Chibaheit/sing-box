@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 
@@ -22,7 +23,24 @@ def require(condition, message):
         raise ValueError(message)
 
 
+def validate_manifest(manifest=MANIFEST):
+    app = manifest["app"]
+    require(type(app["previous_version_code"]) is int and app["previous_version_code"] >= 734,
+            "Previous distributed version code must be at least 734")
+    require(type(app["version_code"]) is int
+            and app["previous_version_code"] < app["version_code"] <= 2100000000,
+            "Version code must exceed every previously distributed custom build")
+    require(re.fullmatch(re.escape(app["upstream_version"]) + r"-chibaheit\.[1-9][0-9]*",
+                         app["version_name"]) is not None, "Invalid custom version name")
+    require(manifest["libbox"]["local_version_tag"] == "v" + app["version_name"],
+            "Core/app version mismatch")
+    require(app["application_id"] == "io.chibaheit.sfa"
+            and app["gradle_task"] == ":app:assembleOtherRelease",
+            "Expected custom unsigned release")
+
+
 def check_pins(core):
+    validate_manifest()
     app = core / MANIFEST["app"]["path"]
     for name, root in (("core", core), ("app", app)):
         require(git(root, "rev-parse", "HEAD") == MANIFEST[name]["revision"],
