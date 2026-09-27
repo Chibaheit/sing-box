@@ -229,6 +229,116 @@ the patch, and executes both service projections to verify that unsupported
 auto-redirect throws. It does **not** compile complete Android services, generate
 an AAR, assemble an APK, or prove on-device behavior.
 
+### Second hosted build: iteration 2
+
+Run `36281916905`, job `108515262260`, used tooling
+`69c8b2714f9943f6ad54c6b57b4bdad90dad081a` from the installed workflow at
+`2de276b12e5d8e6c29d4cb9e174f9fae741923d5`. Patch 0004 fixed compilation:
+
+```text
+2026-09-27T00:25:58.2326185Z > Task :app:packageOtherDebug
+2026-09-27T00:25:58.2332712Z > Task :app:assembleOtherDebug
+2026-09-27T00:25:58.2341674Z BUILD SUCCESSFUL in 5m 40s
+2026-09-27T00:25:59.8065791Z     fingerprint = certificate_digest(report)
+2026-09-27T00:25:59.8071749Z ValueError: Expected exactly one verified signing certificate
+```
+
+This is a distinct collector failure, not another compile error. Reaching that
+line proves source provenance, APK count, package/version/label/debug, ABI/ELF
+checks and the `apksigner verify` subprocess completed successfully. It does
+not mean collection completed: no fingerprint/provenance bundle was produced,
+upload was skipped, and Actions returned `{"total_count":0,"artifacts":[]}`.
+The hosted runner finished and this recipe has no APK cache or alternate upload.
+There is no identified salvage path; do not claim a downloadable or independently
+reverified sing-box APK.
+
+The old collector captured but never printed the signing report. Its exact
+contents and ephemeral certificate digest cannot be recovered from these logs.
+An independently confirmed parser incompatibility is that build-tools **37.0.0** reports a
+single ordinary signer as `V3.0 Signer:` (or `V2 Signer:` / `V1 Signer:`), not
+`Signer #1`. This is a **probable explanation, not a proven exact cause of the
+lost CI report**. It applies to ordinary single-signer reports without rotation;
+no signing recipe or package/signature/architecture relaxation is needed.
+The cryptographic subprocess check and all APK/source/key-exclusion checks remain.
+
+#### Supported signing-report contract
+
+The collector parses the pinned `apksigner verify --verbose --print-certs`
+stdout only **after the subprocess exits zero**. A nonzero exit remains fatal,
+even with successful-looking stdout; parsing does not perform cryptographic
+verification or authenticate arbitrary text. The review's synthetic ambiguous
+reports expose parser-contract bugs, not a demonstrated cryptographic bypass.
+
+The small parser requires exactly one `Verifies` and `Number of signers: 1`.
+It supports contiguous certificate records scoped by `V1 Signer:`, `V2 Signer:`
+or `V3.0 Signer:`; complete legacy `Signer #1` records are also supported, but
+mixing legacy and scheme scopes is rejected as ambiguous. Each record starts at
+`certificate DN` and must contain exactly one of every field emitted by this
+pinned verbose format: certificate DN, certificate SHA-256/SHA-1/MD5, key
+algorithm, positive key size in bits, and public-key SHA-256/SHA-1/MD5.
+Digests must be fixed-length hexadecimal (case is normalized); algorithms are
+limited to RSA, EC and DSA. DN and other non-digest values compare exactly,
+without DN canonicalization. The trial uses the SDK's ordinary RSA debug key.
+
+Complete repeated records, including V2/V3 records, represent **one signer only
+when every certificate and public-key field agrees**, not merely the SHA-256.
+An explicit second signer is rejected even with the same digest. Unknown scopes,
+rotation/source-stamp records, partial records (including SHA-512-only or DN-only
+extra records), missing digests, duplicate fields, interleaved scopes and any
+conflicting DN/algorithm/key/digest fail closed. Matching digest lines alone
+are neither counted as signers nor used to discard other evidence.
+
+Only the known verbose status lines are accepted before records; duplicate or
+contradictory headers, verified v3.1/v3.2 rotation or SourceStamp, control
+characters, warnings and other unknown stdout fail with explicit errors.
+This intentionally is not a general parser for all apksigner versions, rotations,
+certificate types or warning formats; newly encountered formats need a captured
+report and review, not a permissive fallback. On a parse failure the collector
+logs the public report as one JSON-escaped line (including escaped control
+characters), then rethrows before creating artifacts. It neither reads nor
+logs a private key.
+
+`fixtures/apksigner-37-single-signer.txt` is unmodified output of the actual
+`verify --verbose --print-certs` command on AOSP's **prebuilt test APK**
+`golden-aligned-v1v2v3-out.apk`, not output from the lost CI APK or a fabricated
+sing-box artifact. Fixture origin:
+`https://android.googlesource.com/platform/tools/apksig/+/184702d9d18877edf9e5296c4e191cf0aa2b5fbb/src/test/resources/com/android/apksig/golden-aligned-v1v2v3-out.apk`
+(Git blob `e82f67be2a8825676255ef207c8a3a03c2661c91`).
+The official `https://dl.google.com/android/repository/build-tools_r37_linux.zip`
+has repository-advertised SHA-1 `70954e99f4c3d9d46ee70fa32624672fe7cd6ebe`;
+its `android-37.0/lib/apksigner.jar` has SHA-256
+`2defad215d7ff52968a409cde528cdaef7918b115e276b8e3378ca7a178e4180`.
+Two additional unmodified reports, `fixtures/apksigner-37-v1-signer.txt` and
+`fixtures/apksigner-37-v2-signer.txt`, were captured with the same verifier/JDK
+from `golden-aligned-v1-out.apk` (Git blob
+`403e45a2f7f47032bcd2a1a410a310c31030d76e`) and
+`golden-aligned-v1v2-out.apk` (Git blob
+`1c0edeb67b8bbd78f279b1e9b25874a78d478ad9`) in that same AOSP directory/revision.
+All three fixtures were compared byte-for-byte with fresh command output during
+the review fix. They show individual scheme labels; the repeated same-signer
+multi-scheme regression is explicitly **synthetic**, not claimed captured output.
+
+Only this verifier was extracted and run with the existing JDK 17; no full SDK,
+NDK, Gradle build or local sing-box APK was installed/generated. To recapture
+each fixture, substitute its prebuilt APK filename:
+
+```sh
+java -jar /path/to/apksigner.jar verify --verbose --print-certs \
+  /path/to/golden-aligned-v1v2v3-out.apk
+```
+
+The original regression reproduces the same exception text as CI on the real V3
+report before the label fix and passes afterward; it does not recover CI stdout.
+The independent-review regressions first fail on PR5 head
+`79eb564937ca89c1679f7d63e7ddfa254cf85334`: repeated identical scheme records are
+incorrectly rejected while unsupported extra signer/DN/algorithm records are
+ignored. They pass with scoped, complete-record identity checks. Negative tests
+retain rejection of malformed/multiple signers, mismatched APKs and failing
+signature commands before artifact creation, even if the failed command returns
+a valid-looking report.
+The next real CI collection still requires the reviewed manual tooling-pin update
+described above; re-running the old immutable run cannot use this fix.
+
 ### Local checks
 
 The script suite needs Python 3.10+ and Git, with an existing local copy of both
@@ -258,7 +368,8 @@ then reject double apply, wrong refs, local properties and unrelated same-file
 edits. Synthetic ZIP fixtures exercise identity/version/ABI/ELF/certificate
 rejection; **they are not compiled APKs**. Static source checks confirm update
 gates, callback propagation, tags and signing/branding contracts. Kotlin/Gradle
-compilation and APK signature validation occur only in the eventual hosted run.
+compilation and sing-box APK signature validation occur in the hosted run;
+the report fixture separately exercises the real pinned verifier's output format.
 The external workflow contract checker additionally uses PyYAML; `actionlint`
 provides the Actions schema/expression checks and ShellCheck checks shell blocks.
 

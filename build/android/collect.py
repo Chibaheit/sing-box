@@ -42,10 +42,63 @@ def check_apk(apk, badging):
 
 
 def certificate_digest(report):
-    values = re.findall(r"^Signer #\d+ certificate SHA-256 digest: ([0-9a-fA-F]{64})$",
-                        report, re.MULTILINE)
-    require(len(values) == 1, "Expected exactly one verified signing certificate")
-    return values[0].lower()
+    lines = report.splitlines()
+    require(all(char == "\n" or char.isprintable() for char in report),
+            "Unexpected control character in signing report")
+    require(lines.count("Verifies") == 1 and "DOES NOT VERIFY" not in lines,
+            "Expected successful apksigner verification")
+    require([line for line in lines if line.startswith("Number of signers:")]
+            == ["Number of signers: 1"], "Expected exactly one verified signer")
+    fields = {
+        "certificate DN": r"\S(?:.*\S)?",
+        "certificate SHA-256 digest": r"[0-9a-fA-F]{64}",
+        "certificate SHA-1 digest": r"[0-9a-fA-F]{40}",
+        "certificate MD5 digest": r"[0-9a-fA-F]{32}",
+        "key algorithm": r"RSA|EC|DSA",
+        "key size (bits)": r"[1-9][0-9]*",
+        "public key SHA-256 digest": r"[0-9a-fA-F]{64}",
+        "public key SHA-1 digest": r"[0-9a-fA-F]{40}",
+        "public key MD5 digest": r"[0-9a-fA-F]{32}",
+    }
+    headers = {"Verifies", "Number of signers: 1", "Verified for SourceStamp: false"}
+    for scheme, description in (
+        ("1", "JAR signing"), ("2", "APK Signature Scheme v2"),
+        ("3", "APK Signature Scheme v3"), ("3.1", "APK Signature Scheme v3.1"),
+        ("3.2", "APK Signature Scheme v3.2"), ("4", "APK Signature Scheme v4"),
+    ):
+        for status in ("false",) if scheme in ("3.1", "3.2") else ("false", "true"):
+            headers.add(f"Verified using v{scheme} scheme ({description}): {status}")
+    seen_headers = set()
+    records = []
+    scopes = set()
+    scope = None
+    for line in lines:
+        if line in headers:
+            header = line.rsplit(": ", 1)[0]
+            require(not records and header not in seen_headers,
+                    "Duplicate or misplaced signing report header")
+            seen_headers.add(header)
+            continue
+        match = re.fullmatch(r"(Signer #1|V(?:1|2|3\.0) Signer:) ([^:]+): (.+)", line)
+        require(match is not None, "Unsupported signing report line or signer scope")
+        label, field, value = match.groups()
+        require(field in fields and re.fullmatch(fields[field], value) is not None,
+                "Unsupported or malformed signing certificate field")
+        if field == "certificate DN":
+            records.append({})
+            scope = label
+            scopes.add(label)
+        require(records and label == scope, "Missing or interleaved signing certificate record")
+        require(field not in records[-1], "Duplicate signing certificate field")
+        records[-1][field] = value.lower() if field.endswith(" digest") else value
+    require(records and all(record.keys() == fields.keys() for record in records),
+            "Incomplete signing certificate record")
+    require("Signer #1" not in scopes or len(scopes) == 1,
+            "Ambiguous mixed legacy and scheme signer scopes")
+    # Repeated scheme records are one identity only if ALL reported details agree.
+    require(all(record == records[0] for record in records),
+            "Conflicting signing certificate records")
+    return records[0]["certificate SHA-256 digest"]
 
 
 def source_files(root):
@@ -86,7 +139,12 @@ def collect(core, tooling, output):
     check_apk(apk, badging)
     report = subprocess.check_output(
         [str(sdk / "apksigner"), "verify", "--verbose", "--print-certs", str(apk)], text=True)
-    fingerprint = certificate_digest(report)
+    try:
+        fingerprint = certificate_digest(report)
+    except ValueError:
+        print("Rejected public apksigner report: " + json.dumps(report, ensure_ascii=True),
+              flush=True)
+        raise
     output.mkdir(parents=True, exist_ok=False)
     name = f"Chibaheit-SFA-{MANIFEST['app']['version_name']}-arm64-v8a-DEBUG.apk"
     shutil.copyfile(apk, output / name)
