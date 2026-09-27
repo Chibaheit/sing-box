@@ -173,7 +173,8 @@ The required machine-readable graph contains selected components, variants,
 capabilities, edges (including conflict-selected versions), and actual artifact
 SHA-256/content-addressed copies. Local AARs are separately inventoried.
 Missing/unresolved runtime or desugaring configurations, artifacts, or local
-libbox fail before signing. Stale capture is removed at initialization.
+libbox fail before signing. Only stale owned graph files are removed at initialization;
+the capture tree is never recursively deleted.
 The capture also rejects a Configuration still in UNRESOLVED state after assemble,
 rather than silently performing a new resolution. If a future AGP consumes a
 detached copy instead, CI must fail and the hook must be adapted to that actual
@@ -201,15 +202,63 @@ the installed workflow's exact upload allowlist and full structure unchanged;
 the manual UI handoff changes only the immutable tooling ref. No private
 workspace, signing directory, environment dump or giant SDK/cache archive is
 included. Graph paths are project-relative/redacted and URL userinfo/query
-credentials are stripped. Missing embedded notices remain explicit in the index;
+credentials are stripped from graph labels only. Original artifact/source/metadata
+bytes are never rewritten: a shared Python validator scans retained raw evidence
+and ZIP members before publishing the Gradle graph. Optional POM/module/source/R8
+evidence containing credential URLs is omitted with an explicit nonsecret reason
+and the SHA-256 of its original bytes. Required evidence fails with a sanitized
+error instead. The archive validator independently rescans all public leaves,
+including the graph; public Maven inputs are not implicitly trusted.
+The bounded lexical scan recognizes URL userinfo and credential query/fragment
+keys (including percent-encoded keys, camelCase, HTML entities, JSON ASCII escapes
+and UTF-16 ASCII text). Ordinary source variable names such as `token` and safe
+URLs are not redacted or modified. This is not a general secret classifier or a
+decoder for arbitrarily obfuscated/encrypted source.
+
+Capture root, referenced files, reserved notice/index paths and archive output
+must have no symlink ancestors, including the final path. Checks precede reads
+and writes. Archives are published only after validation, via an exclusively owned
+temporary file; existing output is never overwritten and cleanup only unlinks
+owned files. These checks assume a **trusted, nonconcurrent workspace and stable
+inputs**: they are not race-proof against another process swapping paths between
+checks and use. Do not run this collector concurrently or against a hostile
+same-user filesystem.
+
+Limits apply to each ZIP and the overall capture, including declared sizes,
+actual streamed bytes and duplicate-member work. Defaults: 100,000 members per
+archive / 500,000 per capture; 128 MiB per member; 512 MiB expanded per archive;
+2 GiB total scanned bytes (raw files plus expanded members); 2 GiB retained raw
+evidence; 1 MiB per notice / 32 MiB total notices; 32 MiB graph. Oversize notices
+and archives fail, rather than being partially published. Original source JARs
+can be much larger than notices. A bounded URL scan rejects URLs of 64 KiB or
+longer. Reads use 64 KiB chunks; a failing read can exceed a byte limit by at most
+one chunk. Override positive integer limits explicitly with
+`RUNTIME_PROVENANCE_LIMITS`, a JSON object using keys `archive_members`,
+`capture_members`, `member_bytes`, `archive_bytes`, `capture_bytes`,
+`evidence_bytes`, `notice_member_bytes`, `notice_bytes`, `graph_bytes`.
+Use the same reviewed settings for Gradle capture and release collection.
+These limits concern this Android runtime collector only, not the separate
+recovered Go/native supplements.
+
+Bundle verification must derive the exact tooling-file set from the manifest's
+tooling commit, and require the nested archive if and only if
+`android_runtime_provenance` is present. This tooling has 23 files, hence 25 outer
+members including the manifest and runtime archive (the prior release had 20
+tooling files and 21 members). Verify the inner archive hash, regular unique
+allowlisted paths, exact index membership/content hashes and notice/member
+relationships to the captured artifacts; do not merely increase a count or
+allow arbitrary extra members. Preserve prior release reports separately.
+
+Missing embedded notices remain explicit in the index;
 review original source notices too. This is practical publication evidence,
 not full legal certification or an infinite transitive audit.
 
 Reuse the recovered Go/native source supplements from run **36287782750**
 separately at final publication; do not redownload those large sources in CI.
 That prior APK has no recorded full runtime graph and is **not retroactively
-certified** by this change. Wuffs recovery is a separate remaining blocker.
-The next real build is needed only after review, Wuffs readiness, manual UI
+certified** by this change. Exact Wuffs sources have been recovered and their
+SHA checks passed in the parent recovery task; Wuffs recovery is no longer a blocker.
+The next real build is needed only after independent review, manual UI
 tooling-pin installation/read-back, and the user's actual GitHub approval.
 No merge, workflow installation, dispatch, release or APK change is authorized
 by this tooling preparation.
@@ -224,7 +273,11 @@ JAVA_HOME=/path/to/jdk17 GRADLE=/path/to/gradle-9.7.0/bin/gradle \
 This uses a synthetic HTTP Maven repository and an isolated Gradle cache to
 exercise real pinned Gradle APIs, conflict selection, edges/variants, local AARs,
 POM/module/source retrieval, cache layout, hashes, notices, tamper rejection and
-missing-graph failure. Fixture mode is marked and rejected by release collection;
+missing-graph failure. Isolated sentinel tests reject symlink ancestors before
+outside reads/writes; tiny compressed fixtures exercise aggregate limits without
+large expansions. Actual raw POM/module/source credentials are omitted and the
+resulting archive is inspected for leaks and unchanged original hashes.
+Fixture mode is marked and rejected by release collection;
 the fixture's archive-validator branch explicitly uses synthetic data, not an
 Android build result. Existing collector unit tests mock this boundary explicitly.
 

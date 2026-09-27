@@ -1,18 +1,248 @@
 #!/usr/bin/env python3
-"""Validate and archive only explicitly captured public dependency evidence."""
+"""Validate and archive explicitly captured evidence in a trusted, idle workspace."""
 import hashlib
+import html
+import io
 import json
+import os
 from pathlib import Path
+import re
+import sys
 import tarfile
+import tempfile
+from urllib.parse import unquote, urlsplit
 import zipfile
 
 from prepare import require
 
 
+DEFAULT_LIMITS = {
+    "archive_members": 100000, "capture_members": 500000,
+    "member_bytes": 128 * 1024**2, "archive_bytes": 512 * 1024**2,
+    "capture_bytes": 2 * 1024**3, "evidence_bytes": 2 * 1024**3,
+    "notice_member_bytes": 1024**2, "notice_bytes": 32 * 1024**2,
+    "graph_bytes": 32 * 1024**2,
+}
+URL = re.compile(r"(?<![a-z0-9+.-])[a-z][a-z0-9+.-]*://[^\s<>\"'`\\]+", re.I | re.ASCII)
+SECRET_KEY = re.compile(
+    r"(?:^|[_ -])(?:secret|token|password|passwd|pwd|credential|credentials|auth|authorization|"
+    r"signature|sig|key|apikey|accesskey|privatekey|accesstoken|authtoken)(?:$|[_ -])", re.I)
+
+
+def safe_path(path, root=None):
+    path = Path(os.path.abspath(path))
+    require(not any(part == ".." for part in Path(path).parts), "Unsafe evidence path")
+    for ancestor in reversed((path, *path.parents)):
+        require(not ancestor.is_symlink(), "Evidence path has symlink ancestor")
+    if root is not None:
+        require(path.is_relative_to(root), "Evidence path escapes capture")
+    return path
+
+
+def prepare_capture(capture):
+    capture = safe_path(capture)
+    for name in ("files", "notices", "index.json", "graph.json", "graph.pending.json"):
+        safe_path(capture / name, capture)
+    # Only the two graph files are owned outputs; never recursively clean a tree.
+    for name in ("graph.json", "graph.pending.json"):
+        path = capture / name
+        if path.exists():
+            require(path.is_file(), "Invalid graph output")
+            path.unlink()
+
+
+class Budget:
+    def __init__(self):
+        overrides = json.loads(os.environ.get("RUNTIME_PROVENANCE_LIMITS", "{}"))
+        require(isinstance(overrides, dict) and overrides.keys() <= DEFAULT_LIMITS.keys(),
+                "Invalid runtime limits")
+        self.limits = DEFAULT_LIMITS | overrides
+        require(all(type(n) is int and n > 0 for n in self.limits.values()), "Invalid runtime limits")
+        self.used = {}
+
+    def check(self, key, count):
+        require(count <= self.limits[key], "Runtime evidence limit exceeded: " + key)
+
+    def add(self, key, count):
+        self.used[key] = self.used.get(key, 0) + count
+        self.check(key, self.used[key])
+
+
+class UnsafeEvidence(ValueError):
+    pass
+
+
+def check_urls(text):
+    text = re.sub(r"\\u00([0-9a-fA-F]{2})",
+                  lambda match: chr(int(match[1], 16)), text)
+    text = html.unescape(text.replace("\\/", "/").replace("\x00", ""))
+    for match in URL.finditer(text):
+        url = match.group()
+        require(len(url) < 65536, "Runtime evidence URL scan limit exceeded")
+        try:
+            parsed = urlsplit(url)
+        except ValueError:
+            raise UnsafeEvidence("unparseable evidence URL") from None
+        if "@" in parsed.netloc:
+            raise UnsafeEvidence("credential-bearing URL")
+        for field in re.split(r"[&;]", parsed.query + "&" + parsed.fragment):
+            key = unquote(field.split("=", 1)[0]).replace("+", " ")
+            key = re.sub(r"([a-z])([A-Z])", r"\1_\2", key)
+            if SECRET_KEY.search(key):
+                raise UnsafeEvidence("credential-bearing URL")
+    return text
+
+
+def scan(stream, budget, *, archive=False, collect=False):
+    digest = hashlib.sha256()
+    tail = ""
+    data = bytearray() if collect else None
+    count = 0
+    unsafe = None
+    while chunk := stream.read(65536):
+        count += len(chunk)
+        if archive:
+            budget.check("member_bytes", count)
+        budget.add("capture_bytes", len(chunk))
+        digest.update(chunk)
+        text = tail + chunk.decode("latin1")
+        try:
+            text = check_urls(text)
+        except UnsafeEvidence as error:
+            unsafe = error
+        tail = text[-65536:]
+        if collect:
+            data.extend(chunk)
+    return digest.hexdigest(), data, unsafe, count
+
+
+def inspect(path, budget):
+    try:
+        return inspect_evidence(path, budget)
+    except (zipfile.BadZipFile, NotImplementedError, RuntimeError):
+        raise ValueError("Invalid or unsupported ZIP evidence") from None
+
+
+def inspect_evidence(path, budget):
+    budget.add("evidence_bytes", path.stat().st_size)
+    with path.open("rb") as stream:
+        digest, _, unsafe, _ = scan(stream, budget)
+    notices = []
+    if zipfile.is_zipfile(path):
+        with zipfile.ZipFile(path) as source:
+            members = source.infolist()
+            budget.check("archive_members", len(members))
+            budget.add("capture_members", len(members))
+            budget.check("archive_bytes", sum(m.file_size for m in members))
+            budget.check("capture_bytes", budget.used.get("capture_bytes", 0) +
+                         sum(m.file_size for m in members))
+            actual = 0
+            for member in members:
+                budget.check("member_bytes", member.file_size)
+                try:
+                    check_urls(member.filename)
+                except UnsafeEvidence as problem:
+                    unsafe = unsafe or problem
+                if member.is_dir():
+                    continue
+                notice = Path(member.filename).name.upper().split(".")[0] in {
+                    "LICENSE", "NOTICE", "COPYING", "COPYRIGHT"}
+                if notice:
+                    budget.check("notice_member_bytes", member.file_size)
+                    budget.add("notice_bytes", member.file_size)
+                with source.open(member) as stream:
+                    member_hash, data, problem, count = scan(
+                        stream, budget, archive=True, collect=notice)
+                require(count == member.file_size, "Invalid archive member size")
+                actual += count
+                budget.check("archive_bytes", actual)
+                unsafe = unsafe or problem
+                if notice:
+                    notices.append((member.filename, member_hash, bytes(data)))
+    return digest, notices, unsafe
+
+
+def load_capture(capture, budget, graph_name="graph.json"):
+    capture = safe_path(capture)
+    for name in ("files", "notices", "index.json"):
+        safe_path(capture / name, capture)
+    graph = safe_path(capture / graph_name, capture)
+    require(graph.is_file(), "Same-build runtime graph missing")
+    budget.check("graph_bytes", graph.stat().st_size)
+    data = graph.read_bytes()
+    check_urls(data.decode("utf-8"))
+    return capture, graph, json.loads(data)
+
+
+def evidence_path(capture, entry):
+    digest = entry["sha256"]
+    require(isinstance(digest, str) and re.fullmatch("[0-9a-f]{64}", digest),
+            "Invalid evidence digest")
+    require(entry["file"] == f"files/{digest}", "Non-allowlisted evidence path")
+    path = safe_path(capture / entry["file"], capture)
+    require(path.is_file(), "Captured artifact missing or changed")
+    return path
+
+
+def validate_entries(capture, record, budget, omit_optional=False):
+    required = [entry for config in record["configurations"].values()
+                for entry in config["artifacts"]] + record["local_aars"]
+    checked = {}
+    kept = []
+    allowed = {}
+    notices = []
+    missing_notices = []
+    for optional, entry in [(False, e) for e in required] + [
+            (True, e) for e in record["supplements"]]:
+        path = evidence_path(capture, entry)
+        digest = entry["sha256"]
+        if digest not in checked:
+            checked[digest] = inspect(path, budget)
+        actual, embedded, unsafe = checked[digest]
+        require(actual == digest, "Captured artifact missing or changed")
+        if unsafe:
+            if optional and omit_optional:
+                record["supplemental_missing"].append({
+                    "component": entry.get("component"), "kind": entry.get("kind"),
+                    "sha256": digest, "reason": str(unsafe)})
+                continue
+            raise ValueError("Required/public evidence rejected: " + str(unsafe))
+        if optional:
+            kept.append(entry)
+        if entry["file"] in allowed:
+            continue
+        allowed[entry["file"]] = path
+        for member, notice_hash, data in embedded:
+            notices.append({"artifact": digest, "member": member, "sha256": notice_hash})
+            allowed[f"notices/{notice_hash}"] = data
+        if zipfile.is_zipfile(path) and not embedded:
+            missing_notices.append({"artifact": digest, "reason": "no allowlisted embedded notice found"})
+    if omit_optional:
+        record["supplements"] = kept
+    return allowed, notices, missing_notices
+
+
+def sanitize_capture(capture):
+    budget = Budget()
+    capture, _, record = load_capture(capture, budget, "graph.pending.json")
+    validate_entries(capture, record, budget, omit_optional=True)
+    graph = safe_path(capture / "graph.json", capture)
+    require(not graph.exists(), "Graph output already exists")
+    with graph.open("x") as stream:
+        stream.write(json.dumps(record, indent=2) + "\n")
+    (capture / "graph.pending.json").unlink()
+
+
+def sha(path):
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
 def archive(capture, output):
-    graph = capture / "graph.json"
-    require(graph.is_file() and not graph.is_symlink(), "Same-build runtime graph missing")
-    record = json.loads(graph.read_text())
+    output = safe_path(output)
+    require(not output.exists(), "Runtime archive output already exists")
+    budget = Budget()
+    capture, graph, record = load_capture(capture, budget)
     require(record["schema"] == 1 and record["mode"] == "build",
             "Fixture graph is not build evidence")
     require(record["assemble_task"] == ":app:assembleOtherRelease", "Wrong captured variant")
@@ -22,54 +252,41 @@ def archive(capture, output):
             "Runtime/desugaring graph missing")
     require(all(config["components"] and config["edges"] and config["artifacts"]
                 for config in configurations.values()), "Empty runtime resolution")
-    entries = [entry for config in configurations.values() for entry in config["artifacts"]]
-    entries += record["supplements"] + record["local_aars"]
-    allowed = {"graph.json": graph}
-    notices = []
-    missing_notices = []
-    for entry in entries:
-        digest = entry["sha256"]
-        require(len(digest) == 64 and all(c in "0123456789abcdef" for c in digest),
-                "Invalid evidence digest")
-        name = f"files/{digest}"
-        require(entry["file"] == name, "Non-allowlisted evidence path")
-        path = capture / name
-        require(path.is_file() and not path.is_symlink() and
-                hashlib.sha256(path.read_bytes()).hexdigest() == digest,
-                "Captured artifact missing or changed")
-        allowed[name] = path
-        if zipfile.is_zipfile(path):
-            found_notice = False
-            with zipfile.ZipFile(path) as source:
-                for member in source.infolist():
-                    basename = Path(member.filename).name.upper()
-                    if (not member.is_dir() and member.file_size <= 1024 * 1024 and
-                            basename.split(".")[0] in {"LICENSE", "NOTICE", "COPYING", "COPYRIGHT"}):
-                        data = source.read(member)
-                        notice_hash = hashlib.sha256(data).hexdigest()
-                        destination = capture / "notices" / notice_hash
-                        destination.parent.mkdir(exist_ok=True)
-                        destination.write_bytes(data)
-                        allowed[f"notices/{notice_hash}"] = destination
-                        notices.append({"artifact": digest, "member": member.filename,
-                                        "sha256": notice_hash})
-                        found_notice = True
-            if not found_notice:
-                missing_notices.append({"artifact": digest, "reason": "no allowlisted embedded notice found"})
-    index = capture / "index.json"
-    index.write_text(json.dumps({
+    allowed, notices, missing_notices = validate_entries(capture, record, budget)
+    allowed["graph.json"] = graph
+    index = {
         "schema": 1, "notices": notices, "missing_notices": missing_notices,
         "notice_policy": "Embedded notices only; absence is not proof no notice obligation exists",
-        "files": {name: hashlib.sha256(path.read_bytes()).hexdigest()
-                  for name, path in sorted(allowed.items())},
-    }, indent=2) + "\n")
-    allowed["index.json"] = index
-    with tarfile.open(output, "w:gz") as bundle:
-        for name, path in sorted(allowed.items()):
-            info = bundle.gettarinfo(str(path), arcname=name)
-            info.uid = info.gid = 0
-            info.uname = info.gname = ""
-            with path.open("rb") as stream:
-                bundle.addfile(info, stream)
-    return {"archive": output.name, "sha256": hashlib.sha256(output.read_bytes()).hexdigest(),
+        "files": {name: sha(value) if isinstance(value, Path) else hashlib.sha256(value).hexdigest()
+                  for name, value in sorted(allowed.items())},
+    }
+    allowed["index.json"] = (json.dumps(index, indent=2) + "\n").encode()
+    # Publish only after all evidence passes. Cleanup is restricted to our own temp file.
+    with tempfile.NamedTemporaryFile(dir=output.parent, prefix=".runtime-", delete=False) as stream:
+        temporary = Path(stream.name)
+    try:
+        with tarfile.open(temporary, "w:gz") as bundle:
+            for name, value in sorted(allowed.items()):
+                info = tarfile.TarInfo(name)
+                info.mode = 0o644
+                info.size = value.stat().st_size if isinstance(value, Path) else len(value)
+                with value.open("rb") if isinstance(value, Path) else io.BytesIO(value) as stream:
+                    bundle.addfile(info, stream)
+        os.link(temporary, output)
+    finally:
+        temporary.unlink()
+    return {"archive": output.name, "sha256": sha(output),
             "missing": record["supplemental_missing"], "certified": False}
+
+
+if __name__ == "__main__":
+    try:
+        require(len(sys.argv) == 3 and sys.argv[1] in ("--prepare", "--sanitize"),
+                "Invalid runtime validator invocation")
+        if sys.argv[1] == "--prepare":
+            prepare_capture(Path(sys.argv[2]))
+        else:
+            sanitize_capture(Path(sys.argv[2]))
+    except (ValueError, OSError, KeyError, TypeError, zipfile.BadZipFile, RuntimeError):
+        # Malformed inputs and OS/ZIP exceptions may contain private paths or evidence.
+        sys.exit("Runtime evidence validation failed; no public graph published")
