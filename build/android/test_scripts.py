@@ -81,13 +81,13 @@ class Patches(unittest.TestCase):
 
     def assert_artifact_collection(self):
         output = Path(self.temporary.name) / "synthetic-artifacts"
-        apk_dir = self.app / "app/build/outputs/apk/other/debug"
+        apk_dir = Path(self.temporary.name) / "signed"
         apk_dir.mkdir(parents=True)
         fixture = ArtifactChecks()
         fixture.setUp()
         self.addCleanup(fixture.doCleanups)
         fixture.write_zip({"lib/arm64-v8a/libbox.so": fixture.elf})
-        (apk_dir / "synthetic.apk").write_bytes(fixture.apk.read_bytes())
+        (apk_dir / "release.apk").write_bytes(fixture.apk.read_bytes())
         real_check_output = subprocess.check_output
 
         def tool_output(args, **kwargs):
@@ -102,11 +102,12 @@ class Patches(unittest.TestCase):
 
         with patch("collect.provenance", return_value={"synthetic_test": True}), \
                 patch("subprocess.check_output", side_effect=tool_output), \
-                patch.dict(os.environ, {"ANDROID_HOME": "/synthetic-sdk"}):
+                patch("collect.sdk_tools", return_value=Path("/synthetic-sdk")), \
+                patch.dict(os.environ, {"CERT_SHA256": collect.certificate_digest(signer_report())}):
             with patch("collect.certificate_digest", side_effect=ValueError("Rejected report")), \
                     patch("sys.stdout", new_callable=io.StringIO) as log:
                 with self.assertRaisesRegex(ValueError, "Rejected report"):
-                    collect.collect(self.core, CORE_SOURCE, output)
+                    collect.collect(self.core, prepare.HERE.parents[1], apk_dir, output)
                 self.assertFalse(output.exists())
                 self.assertEqual(log.getvalue(),
                                  "Rejected public apksigner report: "
@@ -120,17 +121,19 @@ class Patches(unittest.TestCase):
 
             with patch("subprocess.check_output", side_effect=signature_failure):
                 with self.assertRaises(subprocess.CalledProcessError):
-                    collect.collect(self.core, CORE_SOURCE, output)
+                    collect.collect(self.core, prepare.HERE.parents[1], apk_dir, output)
                 self.assertFalse(output.exists())
-            collect.collect(self.core, CORE_SOURCE, output)
+            collect.collect(self.core, prepare.HERE.parents[1], apk_dir, output)
         expected = {
-            "Chibaheit-SFA-1.14.1-chibaheit.1-arm64-v8a-DEBUG.apk",
+            f"Chibaheit-SFA-{prepare.MANIFEST['app']['version_name']}-arm64-v8a-RELEASE.apk",
             "certificate-sha256.txt", "source-manifest.json", "SHA256SUMS",
             "source-patch-bundle.tar.gz", "core-source.tar.gz", "app-source.tar.gz",
         }
         self.assertEqual({p.name for p in output.iterdir()}, expected)
         record = json.loads((output / "source-manifest.json").read_text())
         self.assertTrue(record["synthetic_test"])
+        self.assertFalse(record["debuggable"])
+        self.assertEqual(record["apk_sha256"], hashlib.sha256(fixture.apk.read_bytes()).hexdigest())
         self.assertEqual(record["certificate_sha256"],
                          "fb5dbd3c669af9fc236c6991e6387b7f11ff0590997f22d0f5c74ff40e04fca8")
         checksums = (output / "SHA256SUMS").read_text().splitlines()
@@ -153,6 +156,15 @@ class Patches(unittest.TestCase):
                       'include("arm64-v8a")', 'buildConfigField("boolean", "CUSTOM_BUILD", "true")',
                       'signingConfig = signingConfigs.getByName("debug")'):
             self.assertIn(token, build)
+        release = build.split("        release {", 1)[1].split("\n        }", 1)[0]
+        self.assertIn("signingConfig = null", release)
+        self.assertIn("isDebuggable = false", release)
+        self.assertNotIn("signingConfigs", release)
+        self.assertNotIn('create("release")', build)
+        self.assertNotIn('file("release.keystore")', build)
+        self.assertIn('create("other")', build)
+        self.assertIn('fileName.replace("-release", "")', build)
+        self.assertIn('fileName.replace("-other", "")', build)
         self.assertNotIn('include("armeabi-v7a"', build)
         for strings in (app / "app/src/main/res").glob("values*/strings.xml"):
             text = strings.read_text()
@@ -197,7 +209,8 @@ class Patches(unittest.TestCase):
         self.assertEqual(tags, manifest["libbox"]["tags"])
         self.assertIn("VERSION_NAME=" + manifest["app"]["version_name"],
                       (app / "version.properties").read_text())
-        self.assertIn("VERSION_CODE=734", (app / "version.properties").read_text())
+        self.assertIn("VERSION_CODE=" + str(manifest["app"]["version_code"]),
+                      (app / "version.properties").read_text())
         self.assertIn("distributionSha256Sum=" + manifest["toolchain"]["gradle_sha256"],
                       (app / "gradle/wrapper/gradle-wrapper.properties").read_text())
         self.assertNotIn("app/release.keystore", collect.source_files(app))
@@ -219,8 +232,9 @@ class ArtifactChecks(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.apk = Path(self.temporary.name) / "synthetic.zip"
         self.badging = (
-            "package: name='io.chibaheit.sfa' versionCode='734' versionName='1.14.1-chibaheit.1'\n"
-            "application-label:'Chibaheit SFA'\napplication-debuggable\nnative-code: 'arm64-v8a'\n"
+            f"package: name='io.chibaheit.sfa' versionCode='{prepare.MANIFEST['app']['version_code']}' "
+            f"versionName='{prepare.MANIFEST['app']['version_name']}'\n"
+            "application-label:'Chibaheit SFA'\nnative-code: 'arm64-v8a'\n"
         )
         self.elf = b"\x7fELF\x02\x01" + bytes(12) + (183).to_bytes(2, "little")
 
@@ -233,12 +247,13 @@ class ArtifactChecks(unittest.TestCase):
         self.write_zip({"lib/arm64-v8a/libbox.so": self.elf})
         collect.check_apk(self.apk, self.badging)
 
-    def test_reject_identity_version_release_and_universal(self):
+    def test_reject_identity_version_debug_and_universal(self):
         self.write_zip({"lib/arm64-v8a/libbox.so": self.elf})
         for bad in (self.badging.replace("io.chibaheit.sfa", "io.nekohasekai.sfa"),
-                    self.badging.replace("734", "739"), self.badging.replace("1.14.1", "1.14.2"),
+                    self.badging.replace(str(prepare.MANIFEST["app"]["version_code"]), "733"),
+                    self.badging.replace("1.14.1", "1.14.2"),
                     self.badging.replace("Chibaheit SFA", "sing-box"),
-                    self.badging.replace("application-debuggable", ""),
+                    self.badging + "application-debuggable\n",
                     self.badging.replace("'arm64-v8a'", "'arm64-v8a' 'x86_64'")):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 collect.check_apk(self.apk, bad)

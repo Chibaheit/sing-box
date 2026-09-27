@@ -16,13 +16,15 @@
       "patches/app/0004-pinned-libbox-api.patch"
     ],
     "upstream_version": "1.14.1",
-    "version_name": "1.14.1-chibaheit.1",
-    "version_code": 734,
+    "version_name": "1.14.1-chibaheit.2",
+    "version_code": 735,
+    "previous_version_code": 734,
     "application_id": "io.chibaheit.sfa",
     "namespace": "io.nekohasekai.sfa",
     "label": "Chibaheit SFA",
     "abi": "arm64-v8a",
-    "gradle_task": ":app:assembleOtherDebug"
+    "gradle_task": ":app:assembleOtherRelease",
+    "unsigned_apk_directory": "app/build/outputs/apk/other/release"
   },
   "toolchain": {
     "go": "1.26.8",
@@ -43,7 +45,7 @@
   },
   "libbox": {
     "command": ["go", "run", "./cmd/internal/build_libbox", "-target", "android", "-platform", "android/arm64"],
-    "local_version_tag": "v1.14.1-chibaheit.1",
+    "local_version_tag": "v1.14.1-chibaheit.2",
     "main_android_api": 24,
     "legacy_android_api": 21,
     "tags": [
@@ -56,6 +58,11 @@
     ],
     "legacy_excluded_tags": ["with_naive_outbound"]
   },
-  "signing": "Ephemeral runner-generated Android debug key; not a stable distribution identity",
+  "signing": {
+    "mode": "unsigned OtherRelease, then owner-controlled apksigner",
+    "certificate_environment": "CERT_SHA256",
+    "apksigner_jar_sha256": "2defad215d7ff52968a409cde528cdaef7918b115e276b8e3378ca7a178e4180",
+    "required_inputs": ["KEYSTORE_B64", "KEYSTORE_PASSWORD", "KEY_ALIAS", "KEY_PASSWORD", "CERT_SHA256"]
+  },
   "device": "Galaxy Fold6; arm64-v8a candidate, actual OS and supported ABIs require adb verification"
 }

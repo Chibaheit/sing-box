@@ -21,6 +21,8 @@ def validate(path):
     job = workflow["jobs"]["build"]
     require(job["runs-on"] == "ubuntu-24.04", "Unexpected runner")
     require("permissions" not in job, "Unexpected job permissions")
+    require(job["environment"] == "android-release", "Protected release environment required")
+    require(job["env"] == {"PYTHONDONTWRITEBYTECODE": "1"}, "No job-wide signing inputs")
     steps = job["steps"]
     uses = [step["uses"] for step in steps if "uses" in step]
     expected = [
@@ -53,15 +55,23 @@ def validate(path):
     require(sdk["accept-android-sdk-licenses"] == "true", "License acceptance step required")
     upload = action_options["actions/upload-artifact"]
     require(set(upload["path"].splitlines()) == {
-        "artifacts/*-DEBUG.apk", "artifacts/SHA256SUMS", "artifacts/certificate-sha256.txt",
+        "artifacts/*-RELEASE.apk", "artifacts/SHA256SUMS", "artifacts/certificate-sha256.txt",
         "artifacts/source-manifest.json", "artifacts/source-patch-bundle.tar.gz",
         "artifacts/core-source.tar.gz", "artifacts/app-source.tar.gz",
     }, "Artifact allowlist changed")
     require(upload["if-no-files-found"] == "error", "Missing artifacts must fail")
     require(upload["include-hidden-files"] == "false", "Do not upload hidden files")
-    for forbidden in ("secrets.", "pull_request_target", "contents: write", "gh release",
+    require(upload["name"] == f"Chibaheit-SFA-{MANIFEST['app']['version_name']}-arm64-v8a-RELEASE",
+            "Artifact version mismatch")
+    for forbidden in ("pull_request_target", "contents: write", "gh release",
                       "release.keystore", "update_android_version", "@latest"):
         require(forbidden not in text, f"Forbidden workflow content: {forbidden}")
+    # This validator accepts only the reviewed template, not arbitrary shell with
+    # a few safe-looking keywords. Secrets cannot be added to another step/scope.
+    expected_text = (HERE / "custom-android.yml.in").read_text().replace(
+        "@TOOLING_REVISION@", git(HERE, "rev-parse", "HEAD")).replace(
+        "@VERSION_NAME@", MANIFEST["app"]["version_name"])
+    require(text == expected_text, "Workflow differs from reviewed release template")
     for package in ("platforms;android-37.1", "platforms;android-36", "build-tools;37.0.0",
                     "ndk;28.0.13004108"):
         require(package in text, f"Missing SDK package: {package}")

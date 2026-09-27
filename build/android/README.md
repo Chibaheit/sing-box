@@ -1,10 +1,11 @@
-# Pinned Chibaheit SFA Android debug trial
+# Pinned Chibaheit SFA Android RELEASE
 
 This is a small patch layer, not a new Android fork or protocol implementation.
-Recommended first trial: fork core `4a39ff496a245e1864cdbe608cab09f5d17df9bc`
+The default is now a non-debuggable, owner-signed release, using fork core
+`4a39ff496a245e1864cdbe608cab09f5d17df9bc`
 and its exact `clients/android` gitlink
 `a3668ae6e4bbcb3ceff8461d0cac55d79edf504f`. The app's baseline is **1.14.1,
-versionCode 734**, customized as **1.14.1-chibaheit.1**. It is not official
+versionCode 734**, customized as **1.14.1-chibaheit.2, versionCode 735**. It is not official
 1.14.2. Using the recorded gitlink avoids an unreviewed core/app upgrade, but
 does not guarantee API compatibility: the first hosted build exposed the drift
 documented below. Neither `testing` nor other PRs are synchronized by this recipe.
@@ -16,6 +17,11 @@ layer, and repeating compatibility checks. Do not mix that app with this core
 or relabel this build as 1.14.2. The separate Android configuration work must
 also be checked against this actual binary version before phone use.
 
+The original DEBUG recipe remains available unchanged at tooling commit
+`84878b7e0340059cad7ef4e25780790247cdc79f`; it is an ephemeral-signer trial,
+not an Obtainium update channel. No extra debug/release mode switches are added.
+All five compatibility/identity patches remain in the release recipe.
+
 ## Manual GitHub installation boundary
 
 `custom-android.yml.in` is **non-active build documentation**. No workflow is
@@ -26,17 +32,19 @@ existing `build.yml`.
 After committing this tooling, render outside every checkout:
 
 ```sh
-PYTHONDONTWRITEBYTECODE=1 python3 build/android/render_workflow.py /absolute/outside/repo/delivery
+PYTHONDONTWRITEBYTECODE=1 python3 build/android/render_workflow.py \
+  /home/hermes/outputs/sing-box-android-release \
+  --installed /path/to/read-back-installed-custom-android.yml
 ```
 
-Deliver both `custom-android.yml` and `custom-android.patch`. The generated YAML
+Deliver both `custom-android-release-<full-tooling-SHA>.yml` and the matching
+`.patch` (an update diff against the read-back installed workflow). The generated YAML
 pins this tooling's full commit SHA, the full core SHA, and the verified app
 gitlink; it does not read a moving `dev`/`testing` revision or accept shell inputs.
 
-The user must use **Chibaheit/sing-box > Add file > Create new file** on `testing`
-(the default branch), name it exactly **`.github/workflows/custom-android.yml`**,
-paste the entire delivered YAML, and manually commit using their GitHub UI
-authority. Use the commit message **`Add pinned custom Android workflow [skip ci]`**:
+The user must manually edit **`.github/workflows/custom-android.yml`** on `testing`
+(the default branch), replace it with the entire delivered YAML, and commit using
+their GitHub UI authority. Use **`Update pinned Android RELEASE tooling [skip ci]`**:
 the existing unsafe `build.yml` also triggers on pushes to `testing`, even if only
 a workflow file changes. GitHub's `[skip ci]` directive suppresses those automatic
 push/PR runs; it does **not** suppress the later explicit `workflow_dispatch`.
@@ -53,20 +61,65 @@ Do not push that edit with this credential. Re-running the old failed run still
 uses its old immutable tooling pin; only a new run after the manual update can
 consume the fix.
 
-Only **after that manual commit**, use Actions > **Custom Android DEBUG trial**
-> Run workflow, selecting `testing`. Equivalently, the already-authorized hosted
-build can then be dispatched with:
-
-```sh
-gh workflow run custom-android.yml --repo Chibaheit/sing-box --ref testing
-```
+Only **after owner key setup, manual installation, read-back comparison and
+separate build authorization**, use Actions > **Custom Android RELEASE** >
+Run workflow, selecting `testing`. This job does not authorize a dispatch.
 
 Read back that workflow file before dispatch: it must equal the delivered YAML.
 This preparation task does not dispatch, merge, release, or publish an APK.
-The new workflow has only `workflow_dispatch`, `contents: read`, no secrets,
+The new workflow has only `workflow_dispatch`, `contents: read`, protected signing inputs,
 no cache mutation/GC, and allowlisted `upload-artifact` output. It does not
 execute untrusted pull-request code. Dispatch explicitly accepts Google's
 Android SDK/NDK licenses via the named SDK setup step; review those licenses first.
+
+## Permanent signer setup (owner action, not performed by this patch)
+
+The owner must choose/provision one permanent signing key outside this workflow.
+Do not use upstream `app/release.keystore`, an ephemeral runner key, or a fallback
+debug signer. Keep an encrypted offline backup of the keystore, alias, passwords
+and independently obtained public certificate SHA-256; loss of the private key
+breaks the update channel. Base64 is encoding, **not encryption**. Do not send
+keys/passwords/tokens through chat, source, logs, artifacts or PR descriptions.
+
+In GitHub **Settings > Environments**, create/protect **`android-release`** with
+review approval and allowed deployment branch **`testing`**. Through its masked
+secrets UI, the owner supplies these exact environment-secret names:
+
+| Name | Owner-provided value |
+| --- | --- |
+| `KEYSTORE_B64` | Strict single-line base64 of the backed-up keystore (at most 1 MiB decoded; GitHub's smaller secret-size limit also applies) |
+| `KEYSTORE_PASSWORD` | Keystore password |
+| `KEY_ALIAS` | Alias: starts alphanumeric, then alphanumeric/dot/underscore/hyphen, at most 128 characters |
+| `KEY_PASSWORD` | Private-key password |
+| `CERT_SHA256` | Independently verified signing **certificate** SHA-256: exactly 64 hex digits, no colons |
+
+Passwords must be nonempty printable single-line values. GitHub masks secrets,
+but masking is not the primary protection: scripts disable tracing, do not print
+inputs, pass passwords via apksigner's `env:` sources (never `pass:` command-line
+values), and suppress private signer diagnostics on error. The scripts use
+`KEYSTORE_B64` only; no guessed private file path is read.
+
+`CERT_SHA256` is mandatory protected configuration, **not** read from the APK,
+its checksum, an artifact, workflow input or source checkout. Both signing and the
+collector compare against it independently. An attacker replacing an APK and its
+accompanying certificate text cannot replace this expected identity. Keep this
+secret's provisioning independently verified against the owner's backed-up key.
+It is a public fingerprint, not an APK SHA-256 and not a password.
+
+Preflight runs immediately after immutable tooling checkout, before source/tool
+setup. `build.sh` also checks all five inputs before inspecting source or running
+build tools, then unsets them before any Go/Gradle subprocess. Only the preflight,
+build-entry guard and signing steps receive all five secrets; collection receives
+only `CERT_SHA256`. No secrets are job-global or passed to actions. Bad/missing
+inputs fail closed; correct presence/base64 does not prove the keystore password
+or alias works until the signing step. No credentials have been configured here.
+
+Signing writes only `$RUNNER_TEMP/chibaheit-release-signing/owner.jks`, outside
+the source/workspace, with directory mode 0700/file mode 0600. The shell EXIT/INT/
+TERM traps remove it; a separate CI `if: always()` step repeats cleanup after
+failure/cancellation. Nothing caches or archives this directory. A runner forced
+off before cleanup must be discarded; never use this recipe on a shared persistent
+self-hosted runner. Only hosted Ubuntu runners are supported by the template.
 
 ## Build recipe and source evidence
 
@@ -89,20 +142,22 @@ cp libbox.aar libbox-legacy.aar clients/android/app/libs/
 cd clients/android
 ./gradlew --no-daemon --max-workers=2 \
   '-Dorg.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8' \
-  -Pkotlin.compiler.execution.strategy=in-process :app:assembleOtherDebug
+  -Pkotlin.compiler.execution.strategy=in-process :app:assembleOtherRelease
 ```
 
 Use `build.sh`, not these excerpted commands alone: it validates pins, applies
 patches, checks the SDK and Go, unsets `LOCAL_PROPERTIES`, and rejects any app
 `local.properties` or Play credential file. Supply `ANDROID_HOME`; do not create
 `sdk.dir` properties. The patch binds debug signing explicitly to the SDK debug
-configuration even if signing properties accidentally exist. The upstream
+configuration even if signing properties accidentally exist. Release explicitly
+has `isDebuggable = false` and `signingConfig = null`; the upstream release
+signing configuration is removed entirely. The upstream
 `app/release.keystore` is never opened, used, copied, or uploaded.
 
 `build_libbox` automatically copies to **`../sing-box-for-android/app/libs`**,
 not this repository's submodule. The explicit copy is therefore essential.
 Both API-24 main and API-21 legacy AARs are produced by upstream; only the main
-AAR is linked into `OtherDebug`. The legacy builder excludes
+AAR is linked into `OtherRelease`. The legacy builder excludes
 `with_naive_outbound`. Gradle is limited to two workers/4 GiB heap; Go concurrency
 is two. A full build is deliberately not run locally.
 
@@ -111,7 +166,7 @@ include `with_gvisor`** at this pin. The single-line core build patch adds it:
 the pinned `sing-tun` `stack_gvisor.go` requires that tag. All effective tags
 are recorded and checked by tests. No Shadowsocks or Tailscale implementation
 is duplicated. The shallow, tag-free core checkout gets only the local
-`v1.14.1-chibaheit.1` tag for `build_shared.ReadTag`, because fork `build-*` tags
+manifest's `local_version_tag` (`v1.14.1-chibaheit.2`) for `build_shared.ReadTag`, because fork `build-*` tags
 are not semantic versions. This tag is never pushed. No
 `update_android_version --ci` or dependency-upgrade command runs.
 
@@ -120,7 +175,8 @@ are not semantic versions. This tag is never pushed. No
 1. Core build patch: enable existing gVisor implementation.
 2. App identity patch: package **io.chibaheit.sfa**, visible **Chibaheit SFA**
    in every existing app-name locale, custom version, arm64-only split with
-   universal disabled, wrapper checksum, build-tools pin, explicit debug signing.
+   universal disabled, wrapper checksum, build-tools pin, explicit debug signing
+   and unsigned non-debuggable release configuration.
    Source namespace/classes remain **io.nekohasekai.sfa** for JNI/API compatibility.
 3. Update patch: a `CUSTOM_BUILD` compile-time flag hides custom-updater UI,
    prevents launch checks and first-run update prompts, rejects direct GitHub
@@ -167,16 +223,43 @@ Coexistence does not permit two simultaneous Android VPN owners.
 
 ## Artifacts, signing and reproducibility limits
 
-`collect.py` requires exactly one APK under `app/build/outputs/apk/other/debug`,
-checks package/version/label/debug status with the pinned SDK's `aapt`, verifies
+The pinned app's `app/build.gradle.kts` defines flavor `other`, build type
+`release` and ABI splits. AGP's output directory is therefore
+`clients/android/app/build/outputs/apk/other/release`. Its output-name callback
+removes `-other` and `-release`; **do not search for a `*-release.apk` filename**.
+For this version the unsigned name is expected to be
+`SFA-1.14.1-chibaheit.2-arm64-v8a-unsigned.apk`. `signing.py` instead reads actual
+`output-metadata.json`, requires `variantName=otherRelease`, exact identity/
+version/ABI, one basename ending `-unsigned.apk` and exactly one APK in that
+directory. This source-derived path still needs confirmation in the first real
+release CI build; no local SDK/Gradle build was performed.
+
+After `build.sh`, run `bash build/android/sign.sh CORE SIGNED_OUTPUT`, then
+`python3 build/android/collect.py CORE TOOLING SIGNED_OUTPUT ARTIFACTS` in the
+controlled environment shown in the template. `SIGNED_OUTPUT` must be fresh
+and outside the core checkout. `sign.sh` rejects an already signed input, checks
+16 KiB native alignment using pinned `zipalign -c -P 16 4`, signs into a separate
+directory, verifies the signature/certificate, then rechecks alignment.
+The official build-tools **37.0.0** `lib/apksigner.jar` SHA-256 is enforced
+before signing and collection. Signing enables v1/v2/v3 and disables the v4
+sidecar. Release verification requires **v2**, not merely jarsigner/v1.
+
+`collect.py` accepts only the separate `SIGNED_OUTPUT/release.apk`,
+checks package/version/label and rejects `application-debuggable` with the pinned SDK's `aapt`, verifies
 the signature using `apksigner`, and checks **every native .so is arm64-v8a
 AArch64 ELF64**, including `libbox.so`. It rejects universal or mislabeled APKs.
-Artifacts are the **DEBUG APK**, `SHA256SUMS`, signing-certificate SHA-256,
-source manifest (including tooling commit and patch hashes), source patch bundle,
+Artifacts are **`Chibaheit-SFA-1.14.1-chibaheit.2-arm64-v8a-RELEASE.apk`**,
+`SHA256SUMS`, signing-certificate SHA-256,
+source manifest (including tooling commit, patch hashes, actual signed APK SHA-256,
+certificate, `debuggable=false` and `otherRelease`), source patch bundle,
 and immutable core/app source archives with licenses. No whole workspace,
 build log, key, or credential is uploaded. Source archives contain original
 unpatched HEAD blobs; apply the recorded patches to reconstruct the custom source.
 Signing material is excluded by name before `git archive`, not removed afterward.
+Only tracked, allowlisted public tooling files enter the patch bundle; keystores,
+local.properties, signing `.env` files, signenv/tempkeys directories and untracked
+workspace files are excluded. APK checksums are computed from the final signed
+bytes independently of the certificate digest.
 
 These are reconstructible source pins, not a claim of bit-for-bit reproducibility:
 Temurin 17 patch updates, hosted runner image revisions and remote Gradle/Maven
@@ -188,21 +271,80 @@ sources/licenses beyond the artifact's **14-day** retention, review GPL-3.0 and
 other license obligations, and provide corresponding source alongside binaries.
 This workflow does not authorize or perform distribution.
 
-**The debug key is ephemeral.** A later fresh CI run normally generates a
-different key, so `adb install -r` may reject it. Never upload the debug keystore
-as an Actions artifact. Back up profiles securely; uninstall/reinstall may be
-needed and loses app data/Tailscale identity. Neither package name nor version
-alone guarantees upgradeability. The custom app cannot update the official app.
+**One-time DEBUG migration:** a code-734 trial signed by the old ephemeral debug
+key cannot upgrade in place to a different permanent signer. Increasing the code
+does not fix `INSTALL_FAILED_UPDATE_INCOMPATIBLE`. Unless the owner independently
+has that exact old private key, securely export and check profiles/configuration,
+then plan one authorized uninstall/reinstall of `io.chibaheit.sfa`. Uninstall
+deletes private data, preferences and VPN grants. Exports must **not** be assumed
+to include Tailscale node identity/state; re-enrollment and stale-node cleanup may
+be necessary. Keep exports private. No phone operation is performed here.
 
-For long-term updates, a separate reviewed release-signing workflow needs a new,
-owner-controlled key, durable private backup, and user-provisioned protected
-GitHub signing secrets/environment approvals. Do not reuse upstream's key.
-Passwords/keys must never enter this PR, logs, or artifacts. Keep the same custom
-application ID and certificate and monotonically increase versionCode (next
-custom update must exceed 734). This debug-only recipe intentionally does not
-request passwords, provision secrets, preserve keys, or claim production signing.
+Keep application ID and permanent signer unchanged. `previous_version_code`
+records the highest previously distributed custom code (currently 734);
+`version_code` must exceed it and cannot exceed Android's limit. Codes below or
+equal to 734 are rejected. For the next update record 735 as previous, use at least
+736, advance the `-chibaheit.N` counter, update `version.properties` in the identity
+patch and manifest version/tag together. Artifact names and build's local core tag
+are derived from the manifest, not a fixed .2 constant. If another custom build
+was distributed, exceed its code instead. Official app code 739 has a different
+application ID and is not this fork's floor. No silent upstream sync is permitted.
+
+## Obtainium and separate release publication
+
+An Actions artifact is an expiring authenticated ZIP, **not** an Obtainium release
+source. The build token stays read-only, including artifact upload via Actions'
+artifact service; it cannot publish releases. After owner setup and an authorized
+successful CI build, the parent must separately verify the downloaded APK with
+the pinned verifier and independently supplied `CERT_SHA256`, inspect package/
+code/version/non-debuggable/arm64 identity, check `SHA256SUMS` and provenance pins,
+and preserve corresponding sources/licenses before any publication.
+
+Only then, with separate publication authorization, the parent may use `gh release`
+with the existing repository credential (workflow scope is not required) to
+publish the allowlisted APK, checksums, public certificate, source manifest,
+patch bundle and source archives. Use **both tag and release title**
+`android-sfa-v1.14.1-chibaheit.2`, targeting the reviewed tooling commit; initially
+**prerelease=true, draft=false, make_latest=false** (`gh release create` supports
+`--prerelease --latest=false`). Never overwrite a released APK/tag or desktop
+release. Obtainium cannot work until that non-draft release asset actually exists.
+Publication, merge, workflow installation and dispatch remain owner/parent steps.
+
+In Obtainium, add **`https://github.com/Chibaheit/sing-box`** with these settings:
+
+| English UI setting | Value |
+| --- | --- |
+| Include prereleases | On |
+| Fallback to older releases | On |
+| Filter release titles by regular expression | `^android-sfa-v[0-9]+\.[0-9]+\.[0-9]+-chibaheit\.[0-9]+$` |
+| Filter APKs by regular expression | `^Chibaheit-SFA-[0-9]+\.[0-9]+\.[0-9]+-chibaheit\.[0-9]+-arm64-v8a-RELEASE\.apk$` |
+| Sort method | Release date (`date`) |
+| Verify the 'latest' tag | Off |
+| Use release title as version string | Off |
+| Trim version string with RegEx | `[0-9]+\.[0-9]+\.[0-9]+-chibaheit\.[0-9]+$` |
+| Track-only | Off |
+
+Leave extraction match group blank (whole match), APK-filter inversion off,
+ZIP/tarball inclusion off and release-date-as-version off. Both title and tag
+must use the Android prefix: the title filter checks release `name`, only falling
+back to `tag_name` if the title is blank. Keep older-release fallback on so newer
+desktop releases or incomplete Android releases do not hide a valid older APK.
+The extracted version includes the fork counter and matches APK `versionName`.
+Public releases require no GitHub token on the phone.
+
+These labels/keys and semantics were verified in Obtainium source at
+[`af286fa8d31d7406d6db167e2314d376d74f7696`](https://github.com/ImranR98/Obtainium/tree/af286fa8d31d7406d6db167e2314d376d74f7696),
+specifically `lib/app_sources/github.dart`, `app_source.dart`,
+`lib/services/apk_filter_service.dart` and `assets/translations/en.json`.
+They are settings, not a verified import-JSON schema; none is invented here.
+Installed Obtainium version and phone runtime behavior are still untested.
 
 ## Validation and upgrade procedure
+
+The following hosted-build history concerns the **older DEBUG recipe**, not a
+successful RELEASE build. The later DEBUG run `36284612324` did publish an Actions
+artifact, but no release APK. This patch has only source/fixture validation until
+the owner installs the workflow, provisions secrets and authorizes release CI.
 
 ### First hosted build: iteration 1
 
@@ -341,16 +483,18 @@ described above; re-running the old immutable run cannot use this fix.
 
 ### Local checks
 
-The script suite needs Python 3.10+ and Git, with an existing local copy of both
+The script suite needs Python 3.10+, Git and PyYAML 6.0.3 for release workflow
+checks (CI installs it in an isolated temporary venv), with a local copy of both
 source objects; it fetches them into isolated temporary repositories:
 
 ```sh
 PYTHONDONTWRITEBYTECODE=1 python3 build/android/test_scripts.py \
   --core-source . --app-source clients/android -v
-bash -n build/android/build.sh
-shellcheck build/android/build.sh
-actionlint /outside/repo/delivery/custom-android.yml
-python3 build/android/validate_workflow.py /outside/repo/delivery/custom-android.yml
+PYTHONDONTWRITEBYTECODE=1 python3 build/android/test_release.py -v
+bash -n build/android/build.sh build/android/sign.sh
+shellcheck build/android/build.sh build/android/sign.sh
+actionlint /outside/repo/delivery/custom-android-release-FULL_SHA.yml
+python3 build/android/validate_workflow.py /outside/repo/delivery/custom-android-release-FULL_SHA.yml
 ```
 
 To also run the narrow compiler regression, supply an existing Kotlin 2.4.10
@@ -362,6 +506,25 @@ JAVA_HOME=/path/to/jdk-17 PYTHONDONTWRITEBYTECODE=1 \
   --core-source . --app-source clients/android \
   --kotlin-home /path/to/kotlinc -v
 ```
+
+Release tests also cover missing/invalid signing inputs before any build, version
+regression, AGP metadata selection, independent certificate mismatch, v1-only
+rejection, secret scopes, log redaction and failure cleanup. To run real signing
+on the small AOSP fixture described above, using **only a disposable TEST key**:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 build/android/test_release.py \
+  --apksigner-jar /path/to/build-tools-37/lib/apksigner.jar \
+  --aosp-apk /path/to/golden-aligned-v1v2v3-out.apk \
+  --java-home /path/to/jdk-17 -v
+```
+
+This checks both tool and AOSP fixture hashes, strips the fixture signatures,
+rejects the unsigned APK, generates a one-day TEST key inside a temporary
+directory, signs with the production password-argument helper, independently
+derives its certificate digest, and rejects wrong-cert/tampered APKs. The TEST
+key and all outputs are removed even on failure. It is **not** an end-to-end
+Android/libbox/AGP/R8 build, a release-key setup or a phone upgrade test.
 
 The tests show RED on pristine sources and GREEN after the complete patch layer,
 then reject double apply, wrong refs, local properties and unrelated same-file

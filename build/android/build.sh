@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+set +x +v
 set -euo pipefail
 
 if [[ $# != 1 ]]; then
@@ -6,6 +7,9 @@ if [[ $# != 1 ]]; then
   exit 2
 fi
 tools=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+python3 "$tools/signing.py" preflight
+# No build subprocess inherits signing material.
+unset KEYSTORE_B64 KEYSTORE_PASSWORD KEY_ALIAS KEY_PASSWORD CERT_SHA256
 core=$(cd -- "$1" && pwd)
 app="$core/clients/android"
 unset LOCAL_PROPERTIES
@@ -28,8 +32,10 @@ cd -- "$core"
 # The pinned fork has non-semver build-* tags. A fresh shallow checkout must
 # have no tags; the local-only tag supplies ReadTag's exact custom version.
 [[ -z "$(git tag --list)" ]] || { echo "Expected tag-free shallow core checkout" >&2; exit 1; }
-git tag v1.14.1-chibaheit.1
-[[ "$(git describe --tags)" == v1.14.1-chibaheit.1 ]]
+version_tag=$(PYTHONPATH="$tools" python3 -c \
+  'from prepare import MANIFEST; print(MANIFEST["libbox"]["local_version_tag"])')
+git tag "$version_tag"
+[[ "$(git describe --tags)" == "$version_tag" ]]
 go install github.com/sagernet/gomobile/cmd/gomobile@v0.1.13
 go install github.com/sagernet/gomobile/cmd/gobind@v0.1.13
 go_path=$(go env GOPATH)
@@ -44,5 +50,5 @@ cd -- "$app"
 ./gradlew --no-daemon --max-workers=2 \
   '-Dorg.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8' \
   -Pkotlin.compiler.execution.strategy=in-process \
-  :app:assembleOtherDebug
+  :app:assembleOtherRelease
 python3 "$tools/prepare.py" verify "$core"
