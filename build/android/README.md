@@ -67,7 +67,7 @@ Run workflow, selecting `testing`. This job does not authorize a dispatch.
 
 Read back that workflow file before dispatch: it must equal the delivered YAML.
 This preparation task does not dispatch, merge, release, or publish an APK.
-The new workflow has only `workflow_dispatch`, `contents: read`, protected signing inputs,
+The new workflow has only `workflow_dispatch`, `contents: read`, narrowly scoped signing inputs,
 no cache mutation/GC, and allowlisted `upload-artifact` output. It does not
 execute untrusted pull-request code. Dispatch explicitly accepts Google's
 Android SDK/NDK licenses via the named SDK setup step; review those licenses first.
@@ -81,9 +81,32 @@ and independently obtained public certificate SHA-256; loss of the private key
 breaks the update channel. Base64 is encoding, **not encryption**. Do not send
 keys/passwords/tokens through chat, source, logs, artifacts or PR descriptions.
 
-In GitHub **Settings > Environments**, create/protect **`android-release`** with
-review approval and allowed deployment branch **`testing`**. Through its masked
-secrets UI, the owner supplies these exact environment-secret names:
+**Security setup is pending:** review found no `android-release` environment and
+only repository-scoped signing secrets. The template's `environment: android-release`
+declaration is **not protection**: it does not configure reviewers, branch restrictions
+or migrate secrets. The parent is handling the owner's migration/security decision
+separately. No environment, protection rule or secret is configured by this patch.
+
+Before installation/dispatch, the owner must use **Settings > Environments** to
+create/protect **`android-release`** and verify the saved configuration:
+
+1. Select deployment branch/tag restrictions allowing only the **`testing` branch**,
+   not arbitrary branches or tags. Verify that the policy is actually available
+   for this repository/plan and that other refs are ineligible.
+2. Require approval by an eligible, usable owner reviewer. For a sole-owner
+   repository, leave **Prevent self-review disabled** so the owner can approve
+   their own manual run; this is an approval gate, not independent two-person
+   review. If independent review is required, arrange another eligible reviewer
+   before proceeding. Do not configure an impossible approval requirement.
+3. Provision the independently verified values below through the environment's
+   masked secrets UI. Verify the secret names/scope and protection settings
+   without exposing values. Only a separately authorized run can confirm that
+   approval and the migrated signing inputs work end to end.
+4. **After verified migration, retire the repository-scoped copies** of these
+   secrets. Environment secrets take precedence for this job, but repository
+   copies still allow other eligible workflows to access them without this
+   environment's approval gate. Do not claim migration is secure or complete
+   while those copies remain.
 
 | Name | Owner-provided value |
 | --- | --- |
@@ -91,7 +114,7 @@ secrets UI, the owner supplies these exact environment-secret names:
 | `KEYSTORE_PASSWORD` | Keystore password |
 | `KEY_ALIAS` | Alias: starts alphanumeric, then alphanumeric/dot/underscore/hyphen, at most 128 characters |
 | `KEY_PASSWORD` | Private-key password |
-| `CERT_SHA256` | Independently verified signing **certificate** SHA-256: exactly 64 hex digits, no colons |
+| `CERT_SHA256` | Independently verified signing **certificate** SHA-256: exactly 64 contiguous hex digits or exactly 32 colon-separated hex byte pairs |
 
 Passwords must be nonempty printable single-line values. GitHub masks secrets,
 but masking is not the primary protection: scripts disable tracing, do not print
@@ -105,14 +128,25 @@ collector compare against it independently. An attacker replacing an APK and its
 accompanying certificate text cannot replace this expected identity. Keep this
 secret's provisioning independently verified against the owner's backed-up key.
 It is a public fingerprint, not an APK SHA-256 and not a password.
+Both accepted fingerprint formats are normalized to lowercase 64-digit hex;
+mixed separators, whitespace, punctuation, missing bytes and extra bytes are
+rejected. Normalization never replaces the independent expected-certificate pin
+with a digest read from an APK.
 
 Preflight runs immediately after immutable tooling checkout, before source/tool
-setup. `build.sh` also checks all five inputs before inspecting source or running
-build tools, then unsets them before any Go/Gradle subprocess. Only the preflight,
-build-entry guard and signing steps receive all five secrets; collection receives
-only `CERT_SHA256`. No secrets are job-global or passed to actions. Bad/missing
-inputs fail closed; correct presence/base64 does not prove the keystore password
-or alias works until the signing step. No credentials have been configured here.
+setup. Only the separate preflight and signing steps receive all five inputs;
+collection receives only the public `CERT_SHA256`. The source-build step and
+`build.sh` never receive them: unsetting an inherited variable does not erase it
+from the shell's initial Linux `/proc/<pid>/environ`, which a source child can
+inspect. Local callers must likewise launch the build without signing inputs,
+not export them around the whole recipe. No secrets are job-global or passed to
+actions. Bad/missing inputs fail closed; correct presence/base64 does not prove the keystore password
+or alias works until the signing step.
+
+Step separation is **not a sandbox for untrusted same-user code**. Pinned tooling,
+core/app sources and their build dependencies must be trusted and reviewed;
+malicious code could persist into a later signing step on the same runner. This
+change removes direct build-environment exposure, not that broader trust requirement.
 
 Signing writes only `$RUNNER_TEMP/chibaheit-release-signing/owner.jks`, outside
 the source/workspace, with directory mode 0700/file mode 0600. The shell EXIT/INT/
@@ -497,19 +531,30 @@ actionlint /outside/repo/delivery/custom-android-release-FULL_SHA.yml
 python3 build/android/validate_workflow.py /outside/repo/delivery/custom-android-release-FULL_SHA.yml
 ```
 
-To also run the narrow compiler regression, supply an existing Kotlin 2.4.10
+The default local commands and the template's CI test step **skip** real fixture
+signing and the optional compiler test because their tool/fixture arguments are
+not supplied. Passing that default suite is not all-coverage evidence; record
+executed and skipped counts separately.
+
+To run the narrow compiler regression separately, supply an existing Kotlin 2.4.10
 compiler distribution (no SDK, NDK, Gradle or full local build is needed):
 
 ```sh
 JAVA_HOME=/path/to/jdk-17 PYTHONDONTWRITEBYTECODE=1 \
   python3 build/android/test_scripts.py \
   --core-source . --app-source clients/android \
-  --kotlin-home /path/to/kotlinc -v
+  --kotlin-home /path/to/kotlinc LibboxAPI -v
 ```
 
-Release tests also cover missing/invalid signing inputs before any build, version
+Release tests also cover missing/invalid signing inputs in the early workflow
+preflight, the exact colon-delimited public fingerprint, malformed formats, version
 regression, AGP metadata selection, independent certificate mismatch, v1-only
-rejection, secret scopes, log redaction and failure cleanup. To run real signing
+rejection, secret scopes, log redaction and failure cleanup. On Linux, the actual
+`build.sh` is launched with the template's job/build-step environment, resolving
+secret references to synthetic sentinels. A Go-command shim inspects its own and
+ancestor build-process `/proc` environments, then stops before source preparation.
+It proves those processes did not receive signing variables; it does not prove
+same-user sandboxing or execute a real Go/Gradle build. To run real signing
 on the small AOSP fixture described above, using **only a disposable TEST key**:
 
 ```sh
@@ -520,9 +565,11 @@ PYTHONDONTWRITEBYTECODE=1 python3 build/android/test_release.py \
 ```
 
 This checks both tool and AOSP fixture hashes, strips the fixture signatures,
-rejects the unsigned APK, generates a one-day TEST key inside a temporary
-directory, signs with the production password-argument helper, independently
-derives its certificate digest, and rejects wrong-cert/tampered APKs. The TEST
+rejects the unsigned APK, generates a one-day **PKCS12 TEST key** inside a temporary
+directory (matching store/key passwords as required by JDK PKCS12), exercises real
+preflight with its base64 bytes and colon-separated public certificate, signs
+with the production password-argument helper, independently derives its certificate
+digest, and rejects wrong-cert/tampered APKs. The TEST
 key and all outputs are removed even on failure. It is **not** an end-to-end
 Android/libbox/AGP/R8 build, a release-key setup or a phone upgrade test.
 

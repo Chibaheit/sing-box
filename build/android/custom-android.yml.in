@@ -88,14 +88,8 @@ jobs:
           sdkmanager 'platforms;android-37.1' 'platforms;android-36'
           'build-tools;37.0.0' 'ndk;28.0.13004108'
 
-      # build.sh rechecks inputs, then unsets all five before any build subprocess.
+      # Never inject signing inputs into the source-build process.
       - name: Build arm64 libbox and unsigned OtherRelease APK
-        env:
-          KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
-          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
-          CERT_SHA256: ${{ secrets.CERT_SHA256 }}
         run: bash tooling/build/android/build.sh "$GITHUB_WORKSPACE/source"
 
       - name: Sign release with the protected owner key

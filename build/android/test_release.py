@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -21,6 +22,12 @@ import signing
 APKSIGNER_JAR = None
 AOSP_APK = None
 JAVA_HOME = None
+
+
+def workflow_build_job():
+    import yaml
+    return yaml.load((prepare.HERE / "custom-android.yml.in").read_text(),
+                     Loader=yaml.BaseLoader)["jobs"]["build"]
 
 
 class ReleaseContract(unittest.TestCase):
@@ -54,6 +61,43 @@ class ReleaseContract(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         signing.preflight()
 
+    def test_public_certificate_preflight_formats(self):
+        public = ("F0:4E:F5:64:1E:42:D7:F9:8D:6E:69:C6:3F:E1:FF:2B:"
+                  "6F:64:6B:26:C8:48:59:1C:F7:BD:C6:B7:6B:FD:0A:C6")
+        normalized = public.replace(":", "").lower()
+        env = {
+            "PATH": os.environ["PATH"],
+            "KEYSTORE_B64": base64.b64encode(b"synthetic-not-a-keystore").decode(),
+            "KEYSTORE_PASSWORD": "synthetic-store", "KEY_PASSWORD": "synthetic-key",
+            "KEY_ALIAS": "synthetic-alias",
+        }
+        for value in (public, public.lower(), normalized, normalized.upper()):
+            with self.subTest(valid=value):
+                result = subprocess.run(
+                    [sys.executable, str(prepare.HERE / "signing.py"), "preflight"],
+                    env=dict(env, CERT_SHA256=value), capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                with patch.dict(os.environ, {"CERT_SHA256": value}, clear=True):
+                    self.assertEqual(signing.expected_certificate(), normalized)
+
+    def test_malformed_certificate_preflight(self):
+        valid = ":".join(["AB"] * 32)
+        env = {
+            "KEYSTORE_B64": base64.b64encode(b"synthetic-not-a-keystore").decode(),
+            "KEYSTORE_PASSWORD": "synthetic-store", "KEY_PASSWORD": "synthetic-key",
+            "KEY_ALIAS": "synthetic-alias",
+        }
+        for value in ("", "AB" * 31, "AB" * 33, valid[:-3], valid + ":AB",
+                      valid.replace(":", "", 1), valid.replace(":", "::", 1),
+                      valid.replace(":", "-", 1), valid.replace(":", " "),
+                      ":" + valid, valid + ":", " " + valid, valid + "\n",
+                      valid[:-1] + "G", "A:" + valid[3:], "SHA256:" + valid,
+                      ".".join(["AB"] * 32)):
+            with self.subTest(value=value), patch.dict(
+                    os.environ, dict(env, CERT_SHA256=value), clear=True):
+                with self.assertRaisesRegex(ValueError, "CERT_SHA256"):
+                    signing.preflight()
+
     def test_version_monotonicity(self):
         for code in (733, 734, True, "735"):
             manifest = copy.deepcopy(prepare.MANIFEST)
@@ -76,7 +120,10 @@ class ReleaseContract(unittest.TestCase):
         digest = collect.certificate_digest(report)
         with patch.dict(os.environ, {"CERT_SHA256": digest}):
             self.assertEqual(collect.release_certificate(report), digest)
-        for expected in ("", "cd" * 32):
+        with patch.dict(os.environ, {"CERT_SHA256": ":".join(
+                digest[i:i + 2].upper() for i in range(0, 64, 2))}):
+            self.assertEqual(collect.release_certificate(report), digest)
+        for expected in ("", "cd" * 32, ":".join(["CD"] * 32)):
             with patch.dict(os.environ, {"CERT_SHA256": expected}):
                 with self.assertRaises(ValueError):
                     collect.release_certificate(report)
@@ -87,14 +134,78 @@ class ReleaseContract(unittest.TestCase):
                     "Verified using v2 scheme (APK Signature Scheme v2): false"))
 
     def test_missing_credentials_fail_before_build(self):
+        steps = workflow_build_job()["steps"]
+        guard = steps[1]
+        self.assertEqual(guard["run"], "python3 tooling/build/android/signing.py preflight")
+        self.assertEqual(set(guard["env"]), set(prepare.MANIFEST["signing"]["required_inputs"]))
         with tempfile.TemporaryDirectory(prefix="release-early-test-") as temporary:
             env = {"PATH": os.environ["PATH"], "RUNNER_TEMP": temporary}
             result = subprocess.run(
-                ["bash", str(prepare.HERE / "build.sh"), "/does-not-exist"],
+                [sys.executable, str(prepare.HERE / "signing.py"), "preflight"],
                 env=env, capture_output=True, text=True)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("Missing signing input: KEYSTORE_B64", result.stderr)
-            self.assertNotIn("does-not-exist", result.stderr)
+
+    @unittest.skipUnless(sys.platform == "linux", "Requires Linux /proc environment snapshots")
+    def test_workflow_build_process_environment(self):
+        job = workflow_build_job()
+        step = next(step for step in job["steps"] if "build.sh" in step.get("run", ""))
+        secrets = {
+            "KEYSTORE_B64": base64.b64encode(b"SYNTHETIC-BUILD-KEYSTORE-SENTINEL").decode(),
+            "KEYSTORE_PASSWORD": "SYNTHETIC-BUILD-STORE-SENTINEL",
+            "KEY_PASSWORD": "SYNTHETIC-BUILD-KEY-SENTINEL",
+            "KEY_ALIAS": "SYNTHETIC-BUILD-ALIAS-SENTINEL", "CERT_SHA256": "AC" * 32,
+        }
+        with tempfile.TemporaryDirectory(prefix="release-build-env-test-") as temporary:
+            root = Path(temporary)
+            (root / "tooling").symlink_to(prepare.HERE.parents[1], target_is_directory=True)
+            (root / "source").mkdir()
+            sdk = root / "sdk"
+            for directory in ("licenses", "ndk/28.0.13004108", "platforms/android-37.1",
+                              "platforms/android-36", "build-tools/37.0.0"):
+                (sdk / directory).mkdir(parents=True)
+            (sdk / "licenses/android-sdk-license").touch()
+            (sdk / "ndk/28.0.13004108/source.properties").touch()
+            (sdk / "build-tools/37.0.0/apksigner").touch(mode=0o700)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            shim = bin_dir / "go"
+            # Stop at the first Go command, before source preparation/compilation.
+            # Read only our synthetic child tree, never the test runner's environment.
+            shim.write_text(
+                f"#!{sys.executable}\n"
+                "import json, os\nfrom pathlib import Path\n"
+                "pid = os.getpid()\nsnapshots = []\n"
+                "while pid != int(os.environ['TEST_RUNNER_PID']):\n"
+                "    proc = Path('/proc') / str(pid)\n"
+                "    snapshots.append((proc / 'environ').read_bytes().decode().split('\\0'))\n"
+                "    status = (proc / 'status').read_text().splitlines()\n"
+                "    pid = int(next(line.split()[1] for line in status if line.startswith('PPid:')))\n"
+                "Path(os.environ['TEST_REPORT']).write_text(json.dumps(snapshots))\n"
+                "raise SystemExit(73)\n")
+            shim.chmod(0o700)
+            report = root / "environment.json"
+            env = {
+                "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"],
+                "ANDROID_HOME": str(sdk), "GITHUB_WORKSPACE": str(root),
+                "TEST_REPORT": str(report), "TEST_RUNNER_PID": str(os.getpid()),
+            }
+            for scope in (job.get("env", {}), step.get("env", {})):
+                for name, value in scope.items():
+                    env[name] = next((sentinel for key, sentinel in secrets.items()
+                                      if value == "${{ secrets." + key + " }}"), value)
+            result = subprocess.run(["bash", "-c", step["run"]], cwd=root, env=env,
+                                    capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Go 1.26.8 required", result.stderr)
+            snapshots = json.loads(report.read_text())
+            self.assertGreaterEqual(len(snapshots), 2)
+            for index, entries in enumerate(snapshots):
+                with self.subTest(process=index):
+                    self.assertFalse(set(secrets) & {entry.partition("=")[0] for entry in entries})
+                    for sentinel in secrets.values():
+                        self.assertNotIn(sentinel, "\0".join(entries))
+            self.assertFalse(set(secrets) & set(step.get("env", {})))
 
     def test_archive_exclusions(self):
         for path in ("owner.jks", "app/release.keystore", "local.properties",
@@ -233,6 +344,17 @@ class ReleaseContract(unittest.TestCase):
         workflow = yaml.load(text, Loader=yaml.BaseLoader)
         steps = workflow["jobs"]["build"]["steps"]
         self.assertIn("preflight", steps[1]["run"])
+        self.assertEqual(workflow["jobs"]["build"]["env"], {"PYTHONDONTWRITEBYTECODE": "1"})
+        required = prepare.MANIFEST["signing"]["required_inputs"]
+        secret_steps = {
+            "Require protected signing inputs before setup or build": required,
+            "Sign release with the protected owner key": required,
+            "Verify APK and assemble allowlisted provenance artifacts": ["CERT_SHA256"],
+        }
+        for step in steps:
+            names = secret_steps.get(step["name"], [])
+            self.assertEqual(step.get("env", {}),
+                             {name: "${{ secrets." + name + " }}" for name in names})
         cleanup = next(step for step in steps if "Always remove" in step["name"])
         self.assertEqual(cleanup["if"], "${{ always() }}")
         with tempfile.TemporaryDirectory(prefix="release-workflow-test-") as temporary:
@@ -269,15 +391,15 @@ class RealSigning(unittest.TestCase):
             launcher.chmod(0o700)
             env = {
                 "KEYSTORE_PASSWORD": "disposable-test-store-only",
-                "KEY_PASSWORD": "disposable-test-key-only",
+                "KEY_PASSWORD": "disposable-test-store-only",
                 "KEY_ALIAS": "disposable-test", "TEST_JAVA": str(JAVA_HOME / "bin/java"),
                 "TEST_SIGNER_JAR": str(APKSIGNER_JAR), "ANDROID_HOME": str(root),
             }
-            keystore = root / "disposable-test.jks"
+            keystore = root / "disposable-test.p12"
             with patch.dict(os.environ, env):
                 result = subprocess.run([
                     str(JAVA_HOME / "bin/keytool"), "-genkeypair", "-noprompt",
-                    "-keystore", str(keystore), "-storetype", "JKS",
+                    "-keystore", str(keystore), "-storetype", "PKCS12",
                     "-storepass:env", "KEYSTORE_PASSWORD", "-keypass:env", "KEY_PASSWORD",
                     "-alias", env["KEY_ALIAS"], "-keyalg", "RSA", "-keysize", "2048",
                     "-validity", "1", "-dname", "CN=disposable-test-only",
@@ -288,6 +410,10 @@ class RealSigning(unittest.TestCase):
                     "-storepass:env", "KEYSTORE_PASSWORD", "-alias", env["KEY_ALIAS"],
                 ], stderr=subprocess.DEVNULL)
                 digest = hashlib.sha256(certificate).hexdigest()
+                os.environ["KEYSTORE_B64"] = base64.b64encode(keystore.read_bytes()).decode()
+                os.environ["CERT_SHA256"] = ":".join(
+                    digest[i:i + 2].upper() for i in range(0, 64, 2))
+                self.assertEqual(signing.preflight(), keystore.read_bytes())
                 unsigned = root / "unsigned.apk"
                 with zipfile.ZipFile(AOSP_APK) as source, zipfile.ZipFile(unsigned, "w") as target:
                     for entry in source.infolist():
@@ -308,7 +434,7 @@ class RealSigning(unittest.TestCase):
                     archive.writestr("tampered", b"must fail signature verification")
                 self.assertNotEqual(subprocess.run(
                     [*verify, str(signed)], capture_output=True).returncode, 0)
-            print("Real pinned apksigner: unsigned rejected, TEST-key APK verified, "
+            print("Real pinned apksigner: unsigned rejected, PKCS12 TEST-key APK verified, "
                   "wrong certificate/tampering rejected; temporary TEST key removed")
         self.assertFalse(root.exists())
 

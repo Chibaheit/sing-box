@@ -7,9 +7,6 @@ if [[ $# != 1 ]]; then
   exit 2
 fi
 tools=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-python3 "$tools/signing.py" preflight
-# No build subprocess inherits signing material.
-unset KEYSTORE_B64 KEYSTORE_PASSWORD KEY_ALIAS KEY_PASSWORD CERT_SHA256
 core=$(cd -- "$1" && pwd)
 app="$core/clients/android"
 unset LOCAL_PROPERTIES

@@ -17,9 +17,11 @@ from prepare import HERE, MANIFEST, require, validate_manifest
 
 def expected_certificate():
     value = os.environ.get("CERT_SHA256", "")
-    require(re.fullmatch(r"[0-9a-fA-F]{64}", value) is not None,
-            "CERT_SHA256 must be the protected expected certificate SHA-256 (64 hex digits)")
-    return value.lower()
+    require(re.fullmatch(r"(?:[0-9a-fA-F]{64}|[0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){31})",
+                         value) is not None,
+            "CERT_SHA256 must be the protected expected certificate SHA-256 "
+            "(64 hex digits or 32 colon-separated hex byte pairs)")
+    return value.replace(":", "").lower()
 
 
 def preflight():

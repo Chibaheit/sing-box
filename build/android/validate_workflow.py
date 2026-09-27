@@ -21,7 +21,7 @@ def validate(path):
     job = workflow["jobs"]["build"]
     require(job["runs-on"] == "ubuntu-24.04", "Unexpected runner")
     require("permissions" not in job, "Unexpected job permissions")
-    require(job["environment"] == "android-release", "Protected release environment required")
+    require(job["environment"] == "android-release", "Release environment declaration required")
     require(job["env"] == {"PYTHONDONTWRITEBYTECODE": "1"}, "No job-wide signing inputs")
     steps = job["steps"]
     uses = [step["uses"] for step in steps if "uses" in step]
