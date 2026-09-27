@@ -23,7 +23,7 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: Chibaheit/sing-box
-          ref: 'b8ed7d8c5ceece661c1b9e1e4b12767f8220f3b3'
+          ref: '69c8b2714f9943f6ad54c6b57b4bdad90dad081a'
           path: tooling
           persist-credentials: false
           sparse-checkout: build/android
