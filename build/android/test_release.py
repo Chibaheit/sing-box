@@ -36,7 +36,7 @@ class ReleaseContract(unittest.TestCase):
         test_step = next(step for step in steps
                          if step.get("name") == "Test source patches and artifact rejection cases")
         self.assertEqual(test_step["run"].splitlines()[-1],
-                         "python3 tooling/build/android/test_runtime.py -v")
+                         "python3 tooling/build/android/test_runtime_v2.py -v")
         self.assertNotIn("GRADLE", test_step["run"])
         self.assertNotIn("env", test_step)
 

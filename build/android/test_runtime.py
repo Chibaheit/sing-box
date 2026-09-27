@@ -23,7 +23,13 @@ HERE = Path(__file__).resolve().parent
 
 
 class RuntimeSafety(unittest.TestCase):
+    """Historical schema-1 revalidation only; new publication tests are in test_runtime_v2."""
     def setUp(self):
+        for name, replacement in (("archive", runtime_provenance.archive_legacy),
+                                  ("sanitize_capture", runtime_provenance.sanitize_legacy_capture)):
+            override = patch.object(runtime_provenance, name, replacement)
+            override.start()
+            self.addCleanup(override.stop)
         self.temporary = tempfile.TemporaryDirectory(prefix="runtime-safety-")
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
@@ -488,10 +494,10 @@ tasks.register('signFixture') {
             canary = "DIAGNOSTIC_PRIVATE_SENTINEL"
             cases = [
                 ("safe-control", b"safe", None, None),
-                ("malformed-zip", b"PK\x03\x04" + canary.encode(), "invalid_zip", None),
+                ("malformed-binary-is-not-published", b"PK\x03\x04" + canary.encode(), None, None),
                 ("credential-canary", ("https://example.invalid/?token=" + canary).encode(),
-                 "credential_url", None),
-                ("budget-count", stream.getvalue(), "budget_exceeded", {"archive_members": 2}),
+                 None, None),
+                ("binary-not-source-budget", stream.getvalue(), None, {"archive_members": 2}),
             ]
             for name, data, reason, limits in cases:
                 with self.subTest(case=name):
@@ -556,6 +562,8 @@ tasks.register('signFixture') {
                 ("valid-with-private-stdout", encoded),
             ]
             (app / "libs/libbox.aar").write_bytes(b"safe")
+            (app / "signed").unlink(missing_ok=True)
+            (app / "build/runtime-provenance/graph.json").unlink(missing_ok=True)
             for name, stderr in malformed:
                 with self.subTest(child=name):
                     (tooling / "runtime_provenance.py").write_text(
@@ -618,13 +626,15 @@ tasks.register('signFixture') {
                         "component": {"group": "example", "module": "leaf", "version": "2"},
                         "variants": [{"name": "runtime", "attributes": {
                             "org.gradle.usage": "java-runtime",
-                            "fixture.origin": "https://user:password@example.invalid/source?token=fixture-module-secret"},
+                            "fixture.origin": "public-fixture"},
                                       "files": [{"name": artifact.name, "url": artifact.name,
                                                  "size": artifact.stat().st_size,
                                                  "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest()}]}]
                     }))
             (app / "libs").mkdir()
-            (app / "libs/libbox.aar").write_bytes(b"synthetic local AAR")
+            (app / "libs/libbox.aar").write_bytes(
+                Path(os.environ["RETAINED_AAR"]).read_bytes() if os.environ.get("RETAINED_AAR")
+                else b"synthetic local AAR")
             server = http.server.ThreadingHTTPServer(("127.0.0.1", 0),
                 functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(root / "repo")))
             self.addCleanup(server.server_close)
@@ -660,17 +670,23 @@ tasks.register('assembleOtherRelease') {
             self.assertNotIn("example:leaf:1", [c["id"] for c in runtime["components"]])
             self.assertTrue(any(e["selected"] == "example:leaf:2" and
                                 e["requested"] == "example:leaf:1" for e in runtime["edges"]))
-            self.assertEqual(sorted(a["name"] for a in runtime["artifacts"]),
-                             (app / "assembled.txt").read_text().splitlines())
             for artifact in runtime["artifacts"]:
-                data = (output / artifact["file"]).read_bytes()
+                self.assertNotIn("file", artifact)
+                if artifact["component"] == "local:libbox":
+                    original_artifact = app / "libs/libbox.aar"
+                else:
+                    group, name, version = artifact["component"].split(":")
+                    original_artifact = root / f"repo/{group}/{name}/{version}/{name}-{version}.jar"
+                data = original_artifact.read_bytes()
                 self.assertEqual(hashlib.sha256(data).hexdigest(), artifact["sha256"])
+                self.assertEqual(len(data), artifact["size"])
+                self.assertFalse((output / "files" / artifact["sha256"]).exists())
                 self.assertIn("attributes", artifact)
             self.assertIn("coreLibraryDesugaring", record["configurations"])
             self.assertTrue(record["supplemental_missing"])
             self.assertTrue(any(s["kind"] == "sources" for s in record["supplements"]))
             self.assertTrue(any(s["kind"] == "pom" for s in record["supplements"]))
-            for kind in ("pom", "module", "sources"):
+            for kind in ("pom", "sources"):
                 omitted = [s for s in record["supplemental_missing"]
                            if s.get("kind") == kind and s.get("sha256")]
                 self.assertEqual(len(omitted), 1, kind)
@@ -678,7 +694,7 @@ tasks.register('assembleOtherRelease') {
                     "leaf-2-sources.jar" if kind == "sources" else f"leaf-2.{kind}")
                 self.assertEqual(omitted[0]["sha256"],
                                  hashlib.sha256(original.read_bytes()).hexdigest())
-                self.assertEqual(omitted[0]["reason"], "credential-bearing URL")
+                self.assertEqual(omitted[0]["reason"], "rejected_public_material")
             self.assertNotIn(str(root), (output / "graph.json").read_text())
             self.assertNotIn("password", (output / "graph.json").read_text())
             self.assertNotIn("token=secret", (output / "graph.json").read_text())
@@ -689,7 +705,6 @@ tasks.register('assembleOtherRelease') {
             (output / "graph.json").write_text(json.dumps(record))
             runtime_provenance.archive(output, root / "fixture.tar.gz")
             with tarfile.open(root / "fixture.tar.gz") as bundle:
-                self.assertTrue(any(n.startswith("notices/") for n in bundle.getnames()))
                 self.assertIn("index.json", bundle.getnames())
                 self.assertFalse(any("cache" in n for n in bundle.getnames()))
                 for member in bundle.getmembers():
@@ -697,7 +712,7 @@ tasks.register('assembleOtherRelease') {
                     for secret in (b"fixture-pom-secret", b"fixture-source-secret",
                                    b"fixture-module-secret", b"password"):
                         self.assertNotIn(secret, data)
-            (output / runtime["artifacts"][0]["file"]).write_bytes(b"tampered")
+            (output / record["supplements"][0]["file"]).write_bytes(b"tampered")
             with self.assertRaisesRegex(ValueError, "changed"):
                 runtime_provenance.archive(output, root / "bad.tar.gz")
             build = app / "build.gradle"
@@ -706,6 +721,25 @@ tasks.register('assembleOtherRelease') {
             run = subprocess.run(command, cwd=root, text=True, capture_output=True)
             self.assertNotEqual(run.returncode, 0)
             self.assertIn("not consumed by assemble", run.stdout + run.stderr)
+            self.assertFalse((output / "graph.json").exists())
+            build.write_text(original)
+            build.write_text(original + """
+dependencies {
+    components {
+        withModule('example:leaf') {
+            allVariants {
+                attributes {
+                    attribute(Attribute.of('fixture.origin', String),
+                              'https://example.invalid/?token=METADATA_CANARY')
+                }
+            }
+        }
+    }
+}
+""")
+            run = subprocess.run(command, cwd=root, text=True, capture_output=True)
+            self.assertNotEqual(run.returncode, 0)
+            self.assertNotIn("METADATA_CANARY", run.stdout + run.stderr)
             self.assertFalse((output / "graph.json").exists())
             build.write_text(original)
             # Missing configuration must fail, not produce an empty success graph.

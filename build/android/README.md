@@ -171,7 +171,9 @@ unpublished; this evidence-only rebuild needs no gratuitous version bump.
 
 The required machine-readable graph contains selected components, variants,
 capabilities, edges (including conflict-selected versions), and actual artifact
-SHA-256/content-addressed copies. Local AARs are separately inventoried.
+SHA-256, byte sizes and artifact types. Local AARs are separately inventoried
+using validated `local:libbox` / `local:libbox-legacy` tags. Compiled artifacts
+are hashed directly from the consumed local files, never copied to public provenance.
 Missing/unresolved runtime or desugaring configurations, artifacts, or local
 libbox fail before signing. Only stale owned graph files are removed at initialization;
 the capture tree is never recursively deleted.
@@ -187,33 +189,40 @@ Unavailable POMs/modules/sources are explicit missing records, not proof of
 completeness. Gradle's public resolution API does not expose repository origin;
 this is explicitly unavailable, not inferred from repository order.
 
-Available R8 text outputs, merged native/resource/asset output hashes and
-allowlisted R8/native/resource task input hashes are retained. SDK platform and
-candidate NDK runtime inputs have separate classifications: SDK/tool installation
-does not imply incorporation. AGP directory/input coverage must be reviewed in
-the first real CI capture; absent outputs are explicit. These are input evidence,
-not an assertion every byte survives shrinking/packaging.
+Schema 2 deliberately omits speculative SDK/task-output cache inventories and R8
+mapping publication. It records consumed dependency inputs, not an assertion every
+byte survives shrinking/packaging. Repository origin remains unavailable from the
+public ResolutionResult API. Independently recovered compiler/runtime source
+supplements are unchanged; their source-index mapping to the actual new graph
+remains pending. No license-closure or source-certification claim is made.
 
-`runtime_provenance.py` rejects absent/fixture graphs and changed artifacts,
+`runtime_provenance.py` rejects absent/fixture graphs and changed public materials,
 extracts bounded embedded LICENSE/NOTICE/COPYING/COPYRIGHT files, and creates a
 hash-indexed **android-dependency-provenance.tar.gz nested inside the existing
 source-patch-bundle.tar.gz**. Its hash is also in source-manifest.json. This keeps
 the installed workflow's exact upload allowlist and full structure unchanged;
-the diagnostic update's manual UI handoff changes the immutable tooling ref and
-adds the explicit `test_runtime.py -v` invocation to the existing test step. No private
+the manual UI handoff changes the immutable tooling ref and
+adds `test_runtime_v2.py -v` to the existing test step. This is not a ref-only diff. No private
 workspace, signing directory, environment dump or giant SDK/cache archive is
-included. Graph paths are project-relative/redacted and URL userinfo/query
-credentials are stripped from graph labels only. Original artifact/source/metadata
-bytes are never rewritten: a shared Python validator scans retained raw evidence
-and ZIP members, recursively including AAR `classes.jar` and nested source JARs,
-before publishing the Gradle graph. Optional POM/module/source/R8
-evidence containing credential URLs is omitted with an explicit nonsecret reason
-and the SHA-256 of its original bytes. Required evidence fails with a sanitized
-error instead. The archive validator independently rescans all public leaves,
-including the graph; public Maven inputs are not implicitly trusted.
+included. Generated metadata has a strict known schema, validated Maven/local
+identities and attributes; credential URLs fail instead of being silently redacted.
+Original input hashes are proof inputs, not declarations that unscanned binaries
+are certified source. Only explicit `sources`, `pom`, `module`, and `notice` roles
+can be published. Optional rejected materials have an original digest and a fixed
+nonsecret rejection reason. Unknown roles fail. The intended APK remains an
+explicit, separately signature/integrity-verified asset outside provenance.
+
+Source JARs are retained byte-for-byte only if all recursively inspected members
+are allowlisted UTF-8 source/notice text or bounded nested source archives.
+Compiled members, private keys, malformed archives, unsafe paths, symlinks,
+unknown ZIP extra fields and credential-bearing text reject the entire optional
+archive. Nothing is silently extracted/rewritten and mislabeled with its original
+archive hash. ZIP container/compressed bytes and dependency binaries are never
+decoded as plaintext by schema 2. Notices are extracted only from verified source
+materials; binary-container notice extraction is deliberately not attempted.
 The bounded lexical scan recognizes URL userinfo and credential query/fragment
 keys (including percent-encoded keys, camelCase, HTML entities, JSON ASCII escapes
-and UTF-16 ASCII text). Ordinary source variable names such as `token` and safe
+and JSON ASCII escapes). Non-UTF-8 public material is rejected. Ordinary source variable names such as `token` and safe
 URLs are not redacted or modified. This is not a general secret classifier or a
 decoder for arbitrarily obfuscated/encrypted source.
 Uninspectable nested ZIP evidence is not certified: malformed/unsupported ZIPs
@@ -287,27 +296,40 @@ Graph scanning reports `field: graph` without guessing an offending field/index.
 Budget failures additionally contain an allowlisted `budget`, attempted `count`
 and configured `limit`. Integers saturate at 2^63-1 for diagnostics only (that
 value means at least that amount); validation uses the original full values.
-All resource limits, URL and ZIP rules, optional omission behavior, publication
-gates and failure-before-signing behavior remain unchanged.
+Schema-2 public source inspection retains the shared nested archive limits and
+ancestor checks. The old raw-binary scanner is reachable only through explicit
+historical schema-1 helpers, never through new capture/publication. The normal
+publisher rejects schema 1. `verify_archive` selects historical validation only
+for existing schema-1 bundles, preserving their bytes and evidence separately.
 
 The existing hosted test step explicitly runs runtime unit tests before tool
 setup; the two real-Gradle tests honestly skip unless `GRADLE` is configured.
 For local integration, set `GRADLE` to the existing Gradle 9.7.0 executable and
 `JAVA_HOME` to the existing JDK 17 installation, then run
 `PYTHONDONTWRITEBYTECODE=1 python3 build/android/test_runtime.py -v`.
-The synthetic offline diagnostic fixture covers distinct malformed ZIP,
-credential-canary and member-count failures, private/malformed child output,
+The synthetic offline diagnostic fixture covers binary hash-only acceptance,
+private/malformed child output,
 safe control publication and a signing stand-in that never runs on rejection.
 It does not execute AGP, Android assembly or real signing.
 
 Bundle verification must derive the exact tooling-file set from the manifest's
 tooling commit, and require the nested archive if and only if
-`android_runtime_provenance` is present. This tooling has 23 files, hence 25 outer
-members including the manifest and runtime archive (the prior release had 20
-tooling files and 21 members). Verify the inner archive hash, regular unique
+`android_runtime_provenance` is present. Derive file membership from the pinned Git
+tree rather than a fixed count. Verify the inner archive hash, regular unique
 allowlisted paths, exact index membership/content hashes and notice/member
 relationships to the captured artifacts; do not merely increase a count or
 allow arbitrary extra members. Preserve prior release reports separately.
+
+Run 36306431135 rejected input SHA-256
+`5c648f5ff5ef29846556100faf259a3716af1a8d04ea49b5815fbf00bb2028a5`;
+its exact identity/bytes remain unavailable. Retained prior APK `libbox.so`
+(`51cc6c5e92f99fdae83be45bd37405e93b03f90f2de53d799fd210214e585a4d`,
+82,125,832 bytes) reproduces the old Latin-1 credential heuristic but is **not**
+that target AAR. Schema-2 tests record that real binary and a retained real
+appcompat AAR by hash without publishing their bytes. Set `RETAINED_NATIVE` and
+`RETAINED_AAR` to those authorized local evidence paths to run these probes.
+Full AGP integration, a new generated graph, source-index review and any future
+single build remain pending separate review/authorization and the owner gate.
 
 Missing embedded notices remain explicit in the index;
 review original source notices too. This is practical publication evidence,

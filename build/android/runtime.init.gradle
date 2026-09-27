@@ -96,7 +96,7 @@ gradle.projectsEvaluated {
                 if (!target.exists()) file.withInputStream { input ->
                     target.withOutputStream { output -> output << input }
                 }
-                [name: file.name, sha256: hash, file: "files/${hash}"]
+                [sha256: hash, size: file.length(), file: "files/${hash}"]
             }
             def attributes = { attrs ->
                 attrs.keySet().collectEntries { key -> [(key.name): attrs.getAttribute(key).toString()] }
@@ -107,16 +107,18 @@ gradle.projectsEvaluated {
                     (id instanceof org.gradle.api.artifacts.component.ProjectComponentIdentifier ?
                         "project:${id.projectPath}".toString() : 'local-file')
             }
-            def record = [schema: 1, mode: app.findProperty('provenanceFixture') == 'true' ? 'fixture' : 'build',
+            def input = { File file, id ->
+                def local = ['libbox.aar': 'local:libbox', 'libbox-legacy.aar': 'local:libbox-legacy']
+                def selected = id instanceof ModuleComponentIdentifier ? identity(id) :
+                    (local.containsKey(file.name) && file.canonicalFile ==
+                        new File(app.projectDir, "libs/${file.name}").canonicalFile ? local[file.name] : null)
+                if (selected == null) throw new GradleException('Unknown local runtime artifact')
+                [component: selected, sha256: sha(file), size: file.length(),
+                 type: file.name.tokenize('.').last()]
+            }
+            def record = [schema: 2, mode: app.findProperty('provenanceFixture') == 'true' ? 'fixture' : 'build',
                 gradle: gradle.gradleVersion, assemble_task: ':app:assembleOtherRelease',
-                configurations: [:], supplements: [], supplemental_missing: [],
-                repository_origin: 'unavailable: public ResolutionResult API does not expose origin',
-                classification: [
-                    runtime: 'Selected inputs; not proof every byte survives R8/packaging',
-                    desugaring: 'Code transformation and potentially incorporated runtime support',
-                    sdk: 'Android platform APIs are system/build inputs; SDK/NDK tools are not bundled here',
-                    native: 'Use separate recovered Go/Cronet/Ghostty/tree-sitter supplements; no duplicate download'
-                ]]
+                configurations: [:], supplements: [], supplemental_missing: []]
             def configs = app.configurations.findAll {
                 it.canBeResolved && (it.name == 'otherReleaseRuntimeClasspath' ||
                     it.name.toLowerCase().contains('corelibrarydesugaring'))
@@ -145,8 +147,8 @@ gradle.projectsEvaluated {
                                attributes: attributes(edge.resolvedVariant.attributes)]]
                 }
                 def artifacts = config.incoming.artifacts.artifacts.collect { artifact ->
-                    retain(artifact.file) + [component: identity(artifact.id.componentIdentifier),
-                        attributes: attributes(artifact.variant.attributes)]
+                    input(artifact.file, artifact.id.componentIdentifier) +
+                        [attributes: attributes(artifact.variant.attributes)]
                 }
                 if (artifacts.empty) throw new GradleException('Required configuration has no artifacts')
                 record.configurations[config.name] = [components: components, edges: edges, artifacts: artifacts]
@@ -168,7 +170,7 @@ gradle.projectsEvaluated {
                     }
                     record.supplements.addAll(found)
                     if (found.empty) record.supplemental_missing.add([component: identity(module),
-                        kind: kind[2], reason: 'not returned by Gradle artifact query'])
+                        kind: kind[2], reason: 'unavailable'])
                 }
                 // Gradle files-2.1 stores downloaded module metadata, not metadata-* binary indexes.
                 def cache = new File(gradle.gradleUserHomeDir,
@@ -182,71 +184,14 @@ gradle.projectsEvaluated {
                 }
                 record.supplements.addAll(metadata)
                 if (metadata.empty) record.supplemental_missing.add([component: identity(module),
-                    kind: 'module', reason: 'not present in exact-coordinate files-2.1 cache'])
+                    kind: 'module', reason: 'unavailable'])
             }
-            record.local_aars = app.fileTree('libs') { include '*.aar' }.files.collect { retain(it) }
-            if (record.mode == 'build' && !record.local_aars.any { it.name == 'libbox.aar' })
+            record.local_aars = ['libbox.aar', 'libbox-legacy.aar'].collect {
+                new File(app.projectDir, "libs/${it}")
+            }.findAll { it.isFile() }.collect { input(it, null) }
+            if (!record.local_aars.any { it.component == 'local:libbox' })
                 throw new GradleException('Required local libbox.aar missing')
-            record.sdk_inputs = []
-            def sdk = System.getenv('ANDROID_HOME')
-            ['platforms/android-37.1/android.jar', 'platforms/android-36/android.jar',
-             'platforms/android-37.1/core-for-system-modules.jar',
-             'ndk/28.0.13004108/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so'].each { relative ->
-                def file = sdk == null ? null : new File(sdk, relative)
-                if (file != null && file.isFile()) record.sdk_inputs.add([
-                    path: relative, sha256: sha(file),
-                    classification: relative.endsWith('.so') ?
-                        'candidate incorporated NDK runtime; compare to merged native/APK inventory' :
-                        'platform API build/system input, not an application dependency'])
-                else record.supplemental_missing.add([kind: relative, reason: 'SDK input unavailable'])
-            }
-            record.task_inputs = []
-            gradle.taskGraph.allTasks.findAll {
-                it.project == app && it.name.toLowerCase().contains('otherrelease') &&
-                    (it.name.toLowerCase().contains('r8') || it.name.toLowerCase().contains('native') ||
-                     it.name.toLowerCase().contains('resource'))
-            }.each { task ->
-                task.inputs.files.files.findAll { it.isFile() }.each { file ->
-                    def relative = app.projectDir.toPath().relativize(file.toPath()).toString()
-                    if ((relative.startsWith('src/') || relative.startsWith('libs/') ||
-                         relative.startsWith('build/')) &&
-                        file.name ==~ /.*\.(jar|aar|so|a|xml|flat|arsc|dex)/) {
-                        record.task_inputs.add([task: task.path, path: relative, sha256: sha(file),
-                                                classification: 'app/transformed runtime input'])
-                    }
-                }
-            }
-            if (record.task_inputs.empty) record.supplemental_missing.add([
-                kind: 'r8/native/resource-task-inputs', reason: 'no allowlisted file inputs exposed'])
-            record.build_outputs = []
-            ['outputs/mapping/otherRelease', 'intermediates/merged_native_libs/otherRelease',
-             'intermediates/merged_res/otherRelease', 'intermediates/merged_assets/otherRelease'].each { relative ->
-                def dir = new File(app.layout.buildDirectory.get().asFile, relative)
-                if (dir.isDirectory()) {
-                    app.fileTree(dir).files.each { file ->
-                        record.build_outputs.add([path: relative + '/' + dir.toPath().relativize(file.toPath()).toString(),
-                                                  sha256: sha(file), size: file.length()])
-                    }
-                    if (relative.startsWith('outputs/mapping/'))
-                        app.fileTree(dir) { include '*.txt' }.files.each { record.supplements.add(retain(it) + [kind: 'r8']) }
-                } else record.supplemental_missing.add([kind: relative, reason: 'output directory unavailable'])
-            }
-            record.supplemental_missing.add([kind: 'native-prebuilt-source-mapping',
-                reason: 'separate recovered supplements require publication review'])
-            record.policy = [required: 'resolution, edges and artifact hashes: fail build on missing/unresolved',
-                supplemental: 'best effort, explicit missing; publication review required, not certification']
-            def redact
-            redact = { value ->
-                if (value instanceof Map) return value.collectEntries { key, item -> [(key): redact(item)] }
-                if (value instanceof Collection) return value.collect { redact(it) }
-                if (!(value instanceof CharSequence)) return value
-                value.toString().replace(app.rootProject.projectDir.absolutePath, '<project>')
-                    .replace(gradle.gradleUserHomeDir.absolutePath, '<gradle-cache>')
-                    .replace(System.getProperty('user.home'), '<home>')
-                    .replaceAll(/(https?:\/\/)[^\/\s@]+@/, '$1')
-                    .replaceAll(/(https?:\/\/[^\s?#]+)[?#][^\s]*/, '$1')
-            }
-            new File(out, 'graph.pending.json').text = JsonOutput.prettyPrint(JsonOutput.toJson(redact(record))) + '\n'
+            new File(out, 'graph.pending.json').text = JsonOutput.prettyPrint(JsonOutput.toJson(record)) + '\n'
             validate('--sanitize')
         }
     }

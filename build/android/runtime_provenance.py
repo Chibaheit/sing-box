@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Validate and archive explicitly captured evidence in a trusted, idle workspace."""
 import hashlib
+import codecs
 import html
 import io
 import json
@@ -242,13 +243,15 @@ def zip_preflight(stream, budget, depth, expected=False):
     return actual
 
 
-def inspect_zip(stream, budget, depth=1, prefix="", expected=False):
+def inspect_zip(stream, budget, depth=1, prefix="", expected=False, public=False):
     count = zip_preflight(stream, budget, depth, expected)
     notices = []
     unsafe = None
     if count is not None:
         stream.seek(0)
         with zipfile.ZipFile(stream) as source:
+            if public:
+                public_text(io.BytesIO(source.comment), "metadata.txt")
             members = source.infolist()
             require(len(members) == count, "Invalid ZIP directory count")
             budget.check("archive_members", len(members))
@@ -257,6 +260,29 @@ def inspect_zip(stream, budget, depth=1, prefix="", expected=False):
                          sum(m.file_size for m in members))
             actual = 0
             for member in members:
+                if public:
+                    require(member.orig_filename == member.filename and
+                            not any(ord(c) < 32 for c in member.filename),
+                            "Invalid source member name")
+                    require(not member.filename.startswith("/") and "\\" not in member.filename and
+                            all(p not in ("", ".", "..") for p in member.filename.rstrip("/").split("/")),
+                            "Unsafe source member path")
+                    require((member.external_attr >> 16) & 0o170000 != 0o120000,
+                            "Source archive symlink")
+                    public_text(io.BytesIO(member.comment), "metadata.txt")
+                    require(Path(member.filename).suffix.lower() not in
+                            {".aar", ".class", ".so", ".a", ".o", ".dex", ".exe", ".dll"},
+                            "Compiled source member")
+                    extra = member.extra
+                    while extra:
+                        require(len(extra) >= 4, "Invalid source extra field")
+                        tag, length = struct.unpack_from("<HH", extra)
+                        require(length <= len(extra) - 4 and
+                                ((tag == 0xcafe and length == 0) or
+                                 (tag == 0x5455 and length in (1, 5, 9, 13)) or
+                                 (tag == 0x000a and length == 32)),
+                                "Non-allowlisted source extra field")
+                        extra = extra[4 + length:]
                 budget.check("member_bytes", member.file_size)
                 try:
                     check_urls(member.filename)
@@ -270,12 +296,30 @@ def inspect_zip(stream, budget, depth=1, prefix="", expected=False):
                     budget.check("notice_member_bytes", member.file_size)
                     budget.add("notice_bytes", member.file_size)
                 with tempfile.TemporaryFile() as nested, source.open(member) as member_stream:
-                    member_hash, data, problem, count = scan(
-                        member_stream, budget, archive=True, collect=notice, sink=nested)
+                    if public:
+                        member_hash = hashlib.sha256()
+                        count = 0
+                        while chunk := member_stream.read(65536):
+                            count += len(chunk)
+                            budget.check("member_bytes", count)
+                            budget.add("capture_bytes", len(chunk))
+                            member_hash.update(chunk)
+                            nested.write(chunk)
+                        member_hash = member_hash.hexdigest()
+                        nested.seek(0)
+                        data = nested.read() if notice else None
+                        problem = None
+                    else:
+                        member_hash, data, problem, count = scan(
+                            member_stream, budget, archive=True, collect=notice, sink=nested)
                     require(count == member.file_size, "Invalid archive member size")
                     embedded, nested_problem = inspect_zip(
                         nested, budget, depth + 1, prefix + member.filename + "!/",
-                        Path(member.filename).suffix.lower() in {".zip", ".jar", ".aar"})
+                        Path(member.filename).suffix.lower() in {".zip", ".jar", ".aar"}, public)
+                    if public:
+                        nested.seek(0)
+                        if not zipfile.is_zipfile(nested):
+                            public_text(nested, member.filename)
                     notices.extend(embedded)
                     unsafe = unsafe or nested_problem
                 actual += count
@@ -318,7 +362,13 @@ def load_capture(capture, budget, graph_name="graph.json"):
     budget.diagnostic["phase"] = "graph_scan"
     check_urls(data.decode("utf-8"))
     budget.diagnostic["phase"] = "graph_decode"
-    return capture, graph, json.loads(data)
+    def unique(items):
+        result = {}
+        for key, value in items:
+            require(key not in result, "Duplicate metadata key")
+            result[key] = value
+        return result
+    return capture, graph, json.loads(data, object_pairs_hook=unique)
 
 
 def evidence_path(capture, entry):
@@ -378,7 +428,7 @@ def validate_entries(capture, record, budget, omit_optional=False):
     return allowed, notices, missing_notices
 
 
-def sanitize_capture(capture, diagnostic=None):
+def sanitize_legacy_capture(capture, diagnostic=None):
     budget = Budget(diagnostic)
     capture, _, record = load_capture(capture, budget, "graph.pending.json")
     validate_entries(capture, record, budget, omit_optional=True)
@@ -396,7 +446,7 @@ def sha(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-def archive(capture, output):
+def archive_legacy(capture, output):
     output = safe_path(output)
     require(not output.exists(), "Runtime archive output already exists")
     budget = Budget()
@@ -435,6 +485,267 @@ def archive(capture, output):
         temporary.unlink()
     return {"archive": output.name, "sha256": sha(output),
             "missing": record["supplemental_missing"], "certified": False}
+
+
+MATERIAL_ROLES = {"sources", "pom", "module", "notice"}
+TEXT_SUFFIXES = {
+    ".java", ".kt", ".kts", ".scala", ".groovy", ".c", ".h", ".cc", ".cpp", ".hpp",
+    ".rs", ".go", ".py", ".sh", ".xml", ".json", ".properties", ".txt", ".md",
+    ".html", ".css", ".js", ".proto", ".aidl", ".mf", ".gradle", ".yaml", ".yml",
+}
+
+
+def public_text(stream, name):
+    require(Path(name).suffix.lower() in TEXT_SUFFIXES or
+            Path(name).name.upper().split(".")[0] in {"LICENSE", "NOTICE", "COPYING", "COPYRIGHT"},
+            "Non-allowlisted source member")
+    stream.seek(0)
+    decoder = codecs.getincrementaldecoder("utf-8")()
+    tail = ""
+    while chunk := stream.read(65536):
+        text = tail + decoder.decode(chunk)
+        require(not any(ord(c) < 32 and c not in "\n\r\t" for c in text),
+                "Non-text public material")
+        require(not re.search(r"-----BEGIN (?:[A-Z ]*PRIVATE KEY|OPENSSH PRIVATE KEY)-----", text),
+                "Private key material")
+        check_urls(text)
+        tail = text[-65536:]
+    decoder.decode(b"", final=True)
+
+
+def fields(value, required, optional=()):
+    require(isinstance(value, dict) and set(required) <= value.keys() <=
+            set(required) | set(optional), "Unknown or missing schema fields")
+
+
+def label(value):
+    require(isinstance(value, str) and 0 < len(value) <= 512 and
+            re.fullmatch(r"[A-Za-z0-9_.:+ /()\[\]-]+", value) and
+            ".." not in value.split("/"), "Invalid public label")
+    check_urls(value)
+
+
+def component(value):
+    require(isinstance(value, str), "Invalid component")
+    if value in {"local:libbox", "local:libbox-legacy"}:
+        return
+    if value.startswith("project:"):
+        require(re.fullmatch(r"project::(?:[A-Za-z0-9_-]+(?::[A-Za-z0-9_-]+)*)?", value),
+                "Invalid project identity")
+        return
+    require(re.fullmatch(r"[A-Za-z0-9_.+-]+:[A-Za-z0-9_.+-]+:[A-Za-z0-9_.+-]+", value)
+            and all(p not in ("", ".", "..") for part in value.split(":")
+                    for p in part.split(".")), "Invalid Maven coordinate")
+
+
+def attributes(value):
+    require(isinstance(value, dict), "Invalid attributes")
+    for key, item in value.items():
+        label(key)
+        require(not SECRET_KEY.search(key), "Private metadata key")
+        label(item)
+
+
+def variant(value, capabilities=False):
+    fields(value, ("name", "attributes", "capabilities") if capabilities else ("name", "attributes"))
+    label(value["name"])
+    attributes(value["attributes"])
+    if capabilities:
+        require(isinstance(value["capabilities"], list), "Invalid capabilities")
+        for item in value["capabilities"]:
+            component(item)
+
+
+def inventory_entry(entry, material=False):
+    fields(entry, ("component", "sha256", "size", "kind", "file") if material else
+           ("component", "sha256", "size", "type"), () if material else ("attributes",))
+    component(entry["component"])
+    require(isinstance(entry["sha256"], str) and re.fullmatch("[0-9a-f]{64}", entry["sha256"]),
+            "Invalid original digest")
+    require(type(entry["size"]) is int and 0 <= entry["size"] <= DIAGNOSTIC_MAX_INTEGER,
+            "Invalid original size")
+    if material:
+        require(entry["kind"] in MATERIAL_ROLES, "Unknown published material role")
+        require(entry["file"] == "files/" + entry["sha256"], "Invalid material path")
+    else:
+        require(entry["type"] in {"aar", "jar", "so", "a", "dex"}, "Invalid input artifact type")
+        if "attributes" in entry:
+            attributes(entry["attributes"])
+
+
+def validate_schema(record):
+    fields(record, ("schema", "mode", "gradle", "assemble_task", "configurations",
+                    "local_aars", "supplements", "supplemental_missing"))
+    require(type(record["schema"]) is int and record["schema"] == 2,
+            "Legacy schema requires separate historical verification")
+    require(record["mode"] in {"build", "fixture"} and
+            record["assemble_task"] == ":app:assembleOtherRelease", "Wrong captured variant")
+    label(record["gradle"])
+    configs = record["configurations"]
+    require(isinstance(configs, dict) and "otherReleaseRuntimeClasspath" in configs and
+            any("corelibrarydesugaring" in n.lower() for n in configs),
+            "Runtime/desugaring graph missing")
+    for name, config in configs.items():
+        label(name)
+        require(name == "otherReleaseRuntimeClasspath" or
+                "corelibrarydesugaring" in name.lower(), "Unknown configuration")
+        fields(config, ("components", "edges", "artifacts"))
+        require(all(isinstance(config[k], list) for k in config) and
+                config["components"] and config["artifacts"], "Empty runtime resolution")
+        ids = set()
+        for item in config["components"]:
+            fields(item, ("id", "variants"))
+            component(item["id"])
+            ids.add(item["id"])
+            require(isinstance(item["variants"], list), "Invalid variants")
+            for selected in item["variants"]:
+                variant(selected, True)
+        for edge in config["edges"]:
+            fields(edge, ("from", "requested", "selected", "constraint", "variant"))
+            require(edge["from"] in ids and edge["selected"] in ids, "Unknown edge component")
+            component(edge["requested"])
+            require(type(edge["constraint"]) is bool, "Invalid constraint")
+            variant(edge["variant"])
+        for entry in config["artifacts"]:
+            inventory_entry(entry)
+            require(entry["component"] in ids or entry["component"].startswith("local:"),
+                    "Unknown artifact component")
+    for key in ("local_aars", "supplements", "supplemental_missing"):
+        require(isinstance(record[key], list), "Invalid inventory")
+    for entry in record["local_aars"]:
+        inventory_entry(entry)
+        require(entry["component"] in {"local:libbox", "local:libbox-legacy"},
+                "Unknown local artifact")
+    require(any(e["component"] == "local:libbox" for e in record["local_aars"]),
+            "Required local libbox missing")
+    for entry in record["supplements"]:
+        inventory_entry(entry, True)
+    for entry in record["supplemental_missing"]:
+        fields(entry, ("component", "kind", "reason"), ("sha256",))
+        component(entry["component"])
+        require(entry["kind"] in MATERIAL_ROLES, "Unknown omitted role")
+        require(entry["reason"] in {"unavailable", "rejected_public_material"},
+                "Unknown omission reason")
+        if "sha256" in entry:
+            require(re.fullmatch("[0-9a-f]{64}", entry["sha256"]), "Invalid omitted digest")
+
+
+def published_materials(capture, record, budget, omit=False):
+    validate_schema(record)
+    allowed, notices, kept = {}, [], []
+    for index, entry in enumerate(record["supplements"]):
+        budget.diagnostic.update(phase="entry", field="supplements", index=index,
+                                 sha256=entry["sha256"])
+        path = evidence_path(capture, entry)
+        budget.check("evidence_bytes", entry["size"])
+        require(path.stat().st_size == entry["size"] and sha(path) == entry["sha256"],
+                "Public material missing or changed")
+        try:
+            budget.add("evidence_bytes", entry["size"])
+            with path.open("rb") as stream:
+                if entry["kind"] == "sources":
+                    embedded, problem = inspect_zip(stream, budget, expected=True, public=True)
+                    if problem:
+                        raise problem
+                else:
+                    budget.add("capture_bytes", entry["size"])
+                    public_text(stream, "NOTICE" if entry["kind"] == "notice" else "metadata.xml")
+                    embedded = []
+        except (ValueError, zipfile.BadZipFile, NotImplementedError, RuntimeError, EOFError, zlib.error):
+            if not omit:
+                raise ValueError("Rejected public material") from None
+            record["supplemental_missing"].append(dict(
+                component=entry["component"], kind=entry["kind"], sha256=entry["sha256"],
+                reason="rejected_public_material"))
+            continue
+        kept.append(entry)
+        allowed[entry["file"]] = path
+        for member, digest, data in embedded:
+            notices.append(dict(artifact=entry["sha256"], member=member, sha256=digest))
+            allowed["notices/" + digest] = data
+    if omit:
+        record["supplements"] = kept
+    return allowed, notices
+
+
+def sanitize_capture(capture, diagnostic=None):
+    budget = Budget(diagnostic)
+    capture, pending, record = load_capture(capture, budget, "graph.pending.json")
+    published_materials(capture, record, budget, omit=True)
+    budget.diagnostic.clear()
+    budget.diagnostic.update(phase="publication", field="graph")
+    graph = safe_path(capture / "graph.json", capture)
+    with graph.open("x") as stream:
+        stream.write(json.dumps(record, indent=2) + "\n")
+    pending.unlink()
+
+
+def archive(capture, output):
+    output = safe_path(output)
+    require(not output.exists(), "Runtime archive output already exists")
+    budget = Budget()
+    capture, graph, record = load_capture(capture, budget)
+    require(record.get("schema") == 2, "Legacy schema requires separate historical verification")
+    require(record["mode"] == "build", "Fixture graph is not build evidence")
+    allowed, notices = published_materials(capture, record, budget)
+    allowed["graph.json"] = graph
+    index = dict(schema=2, notices=notices,
+                 files={name: sha(value) if isinstance(value, Path) else
+                        hashlib.sha256(value).hexdigest() for name, value in sorted(allowed.items())})
+    allowed["index.json"] = (json.dumps(index, indent=2) + "\n").encode()
+    with tempfile.NamedTemporaryFile(dir=output.parent, prefix=".runtime-", delete=False) as stream:
+        temporary = Path(stream.name)
+    try:
+        with tarfile.open(temporary, "w:gz") as bundle:
+            for name, value in sorted(allowed.items()):
+                info = tarfile.TarInfo(name)
+                info.mode = 0o644
+                info.size = value.stat().st_size if isinstance(value, Path) else len(value)
+                with value.open("rb") if isinstance(value, Path) else io.BytesIO(value) as stream:
+                    bundle.addfile(info, stream)
+        os.link(temporary, output)
+    finally:
+        temporary.unlink()
+    return dict(archive=output.name, sha256=sha(output),
+                missing=record["supplemental_missing"], certified=False)
+
+
+def verify_archive(path, expected_sha):
+    """Revalidate historical schema 1 separately; never upgrade its evidence claims."""
+    require(sha(path) == expected_sha, "Runtime archive hash mismatch")
+    with tempfile.TemporaryDirectory(prefix="verify-runtime-") as temporary:
+        root = Path(temporary)
+        capture = root / "capture"
+        capture.mkdir()
+        members = {}
+        total = 0
+        with tarfile.open(path, "r:gz") as bundle:
+            for item in bundle:
+                require(item.isfile() and item.name not in members and
+                        (item.name in {"graph.json", "index.json"} or
+                         re.fullmatch(r"(files|notices)/[0-9a-f]{64}", item.name)),
+                        "Invalid runtime archive member")
+                total += item.size
+                require(total <= DEFAULT_LIMITS["evidence_bytes"] + DEFAULT_LIMITS["graph_bytes"] * 2
+                        and len(members) < DEFAULT_LIMITS["capture_members"], "Runtime tar limit")
+                with bundle.extractfile(item) as stream:
+                    members[item.name] = stream.read(item.size + 1)
+                require(len(members[item.name]) == item.size, "Truncated runtime member")
+        require({"graph.json", "index.json"} <= members.keys(), "Runtime index missing")
+        for name, data in members.items():
+            target = capture / name
+            target.parent.mkdir(exist_ok=True)
+            target.write_bytes(data)
+        record = json.loads(members["graph.json"])
+        require(type(record.get("schema")) is int and record["schema"] in (1, 2),
+                "Unknown runtime schema")
+        regenerated = root / "verified.tar.gz"
+        writer = archive_legacy if record["schema"] == 1 else archive
+        writer(capture, regenerated)
+        with tarfile.open(regenerated, "r:gz") as bundle:
+            actual = {item.name: bundle.extractfile(item).read() for item in bundle}
+        require(actual == members, "Runtime index/material membership mismatch")
+        return dict(schema=record["schema"], members=len(members), certified=False)
 
 
 def main(argv):
