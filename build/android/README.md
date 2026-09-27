@@ -232,6 +232,9 @@ exactly within their declared compressed extent, with no unused bytes, and decod
 sizes/CRCs must match. This is a narrow supported-container policy, not a general
 ZIP repair/parser: unsupported optional archives are transparently omitted with
 their original digest, never normalized or published with hidden bytes.
+Decoded source chunks cannot exceed the declared member size. Before materializing
+a notice, its actual disk-backed length must match that size and fit the unchanged
+notice limit; the read is explicitly bounded to that validated length.
 ZIP container/compressed bytes and dependency binaries are never
 decoded as plaintext by schema 2. Notices are extracted only from verified source
 materials; binary-container notice extraction is deliberately not attempted.

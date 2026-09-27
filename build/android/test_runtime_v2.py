@@ -187,6 +187,61 @@ class MetadataOnly(unittest.TestCase):
                 struct.pack_into(fmt, changed, offset, value)
                 self.assert_omitted(bytes(changed))
 
+    def test_source_notice_allocation_bounded_before_read(self):
+        cap = runtime.DEFAULT_LIMITS["notice_member_bytes"]
+        temporary_file = tempfile.TemporaryFile
+        for name, payload, declared, nested in [
+            ("LICENSE", b"x" * (4 * cap), 0, False),
+            ("Example.java", b"x" * (4 * cap), 0, False),
+            ("LICENSE", b"x" * (4 * cap), 0, True),
+            ("Example.java", b"x" * (4 * cap), 0, True),
+            ("LICENSE", b"safe notice", 12, False),
+            ("LICENSE", b"safe notice", 11, False),
+            ("LICENSE", b"x" * (cap + 1), cap + 1, False),
+            ("LICENSE", b"x" * cap, cap, False),
+            ("LICENSE", b"x" * cap, cap, True),
+        ]:
+            data = bytearray(self.zipped([(name, payload)]))
+            struct.pack_into("<I", data, 22, declared)
+            struct.pack_into("<I", data, data.index(b"PK\x01\x02") + 24, declared)
+            if len(payload) == 4 * cap and name == "LICENSE":
+                self.assertEqual(len(data), 4192)
+            if nested:
+                data = self.zipped([("nested.jar", data)])
+            reads, opened = [], []
+
+            def tracked_file():
+                stream = temporary_file()
+                opened.append(stream)
+                read = stream.read
+
+                def tracked_read(size=-1):
+                    reads.append((size, stream.tell(), os.fstat(stream.fileno()).st_size))
+                    return read(size)
+
+                stream.read = tracked_read
+                return stream
+
+            with self.subTest(name=name, actual=len(payload), declared=declared, nested=nested):
+                with patch.object(tempfile, "TemporaryFile", tracked_file):
+                    if declared != len(payload) or len(payload) > cap:
+                        with self.assertRaises(ValueError):
+                            runtime.inspect_zip(io.BytesIO(data), runtime.Budget(),
+                                                expected=True, public=True)
+                    else:
+                        notices, problem = runtime.inspect_zip(
+                            io.BytesIO(data), runtime.Budget(), expected=True, public=True)
+                        self.assertIsNone(problem)
+                        self.assertEqual(notices, [(
+                            ("nested.jar!/" if nested else "") + name,
+                            hashlib.sha256(payload).hexdigest(), payload)])
+                self.assertTrue(all(stream.closed for stream in opened))
+                # zipfile's EOF searches use read() after a bounded seek, not at byte zero.
+                self.assertTrue(all(0 <= size <= cap + 1 or
+                                    (size == -1 and position > 0 and length - position <= 65558)
+                                    for size, position, length in reads),
+                                f"unbounded/over-cap temporary reads (request, offset, disk bytes): {reads}")
+
     def test_empty_directory_payload_must_be_valid_and_exhausted(self):
         safe = self.zipped([("assets/", b"")])
         central = safe.index(b"PK\x01\x02")

@@ -385,18 +385,22 @@ def inspect_zip(stream, budget, depth=1, prefix="", expected=False, public=False
                         count = 0
                         for chunk in source_chunks(stream, member):
                             count += len(chunk)
+                            require(count <= member.file_size, "Invalid archive member size")
                             budget.check("member_bytes", count)
                             budget.add("capture_bytes", len(chunk))
                             member_hash.update(chunk)
                             nested.write(chunk)
+                        require(count == member.file_size, "Invalid archive member size")
+                        if notice:
+                            budget.check("notice_member_bytes", count)
                         member_hash = member_hash.hexdigest()
                         nested.seek(0)
-                        data = nested.read() if notice else None
+                        data = nested.read(count) if notice else None
                         problem = None
                     else:
                         member_hash, data, problem, count = scan(
                             member_stream, budget, archive=True, collect=notice, sink=nested)
-                    require(count == member.file_size, "Invalid archive member size")
+                        require(count == member.file_size, "Invalid archive member size")
                     embedded, nested_problem = inspect_zip(
                         nested, budget, depth + 1, prefix + member.filename + "!/",
                         Path(member.filename).suffix.lower() in {".zip", ".jar", ".aar"}, public)
