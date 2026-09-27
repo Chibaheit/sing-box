@@ -229,6 +229,64 @@ the patch, and executes both service projections to verify that unsupported
 auto-redirect throws. It does **not** compile complete Android services, generate
 an AAR, assemble an APK, or prove on-device behavior.
 
+### Second hosted build: iteration 2
+
+Run `36281916905`, job `108515262260`, used tooling
+`69c8b2714f9943f6ad54c6b57b4bdad90dad081a` from the installed workflow at
+`2de276b12e5d8e6c29d4cb9e174f9fae741923d5`. Patch 0004 fixed compilation:
+
+```text
+2026-09-27T00:25:58.2326185Z > Task :app:packageOtherDebug
+2026-09-27T00:25:58.2332712Z > Task :app:assembleOtherDebug
+2026-09-27T00:25:58.2341674Z BUILD SUCCESSFUL in 5m 40s
+2026-09-27T00:25:59.8065791Z     fingerprint = certificate_digest(report)
+2026-09-27T00:25:59.8071749Z ValueError: Expected exactly one verified signing certificate
+```
+
+This is a distinct collector failure, not another compile error. Reaching that
+line proves source provenance, APK count, package/version/label/debug, ABI/ELF
+checks and the `apksigner verify` subprocess completed successfully. It does
+not mean collection completed: no fingerprint/provenance bundle was produced,
+upload was skipped, and Actions returned `{"total_count":0,"artifacts":[]}`.
+The hosted runner finished and this recipe has no APK cache or alternate upload.
+There is no identified salvage path; do not claim a downloadable or independently
+reverified sing-box APK.
+
+The old collector captured but never printed the signing report. Its exact
+contents and ephemeral certificate digest cannot be recovered from these logs.
+The confirmed parser incompatibility is that build-tools **37.0.0** reports a
+single ordinary signer as `V3.0 Signer:` (or `V2 Signer:` / `V1 Signer:`), not
+`Signer #1`. This applies to a single SDK debug signing configuration without
+rotation; no recipe change or relaxation of package/signature/architecture is
+needed. Collection now logs the public verification report before parsing,
+requires `Verifies`, exactly one reported signer and one strictly formatted
+certificate digest, and rejects extra, rotated or unknown certificate records.
+The cryptographic subprocess check and all APK/source/key-exclusion checks remain.
+
+`fixtures/apksigner-37-single-signer.txt` is unmodified output of the actual
+`verify --verbose --print-certs` command on AOSP's **prebuilt test APK**
+`golden-aligned-v1v2v3-out.apk`, not output from the lost CI APK or a fabricated
+sing-box artifact. Fixture origin:
+`https://android.googlesource.com/platform/tools/apksig/+/184702d9d18877edf9e5296c4e191cf0aa2b5fbb/src/test/resources/com/android/apksig/golden-aligned-v1v2v3-out.apk`
+(Git blob `e82f67be2a8825676255ef207c8a3a03c2661c91`).
+The official `https://dl.google.com/android/repository/build-tools_r37_linux.zip`
+has repository-advertised SHA-1 `70954e99f4c3d9d46ee70fa32624672fe7cd6ebe`;
+its `android-37.0/lib/apksigner.jar` has SHA-256
+`2defad215d7ff52968a409cde528cdaef7918b115e276b8e3378ca7a178e4180`.
+Only this verifier was extracted and run with the existing JDK 17; no full SDK,
+NDK, Gradle build or local sing-box APK was installed/generated. To recapture:
+
+```sh
+java -jar /path/to/apksigner.jar verify --verbose --print-certs \
+  /path/to/golden-aligned-v1v2v3-out.apk
+```
+
+The regression reproduces the exact CI exception on this real report before the
+fix and passes afterward. Negative tests retain rejection of malformed/multiple
+signers, mismatched APKs and failing signature commands before artifact creation.
+The next real CI collection still requires the reviewed manual tooling-pin update
+described above; re-running the old immutable run cannot use this fix.
+
 ### Local checks
 
 The script suite needs Python 3.10+ and Git, with an existing local copy of both
@@ -258,7 +316,8 @@ then reject double apply, wrong refs, local properties and unrelated same-file
 edits. Synthetic ZIP fixtures exercise identity/version/ABI/ELF/certificate
 rejection; **they are not compiled APKs**. Static source checks confirm update
 gates, callback propagation, tags and signing/branding contracts. Kotlin/Gradle
-compilation and APK signature validation occur only in the eventual hosted run.
+compilation and sing-box APK signature validation occur in the hosted run;
+the report fixture separately exercises the real pinned verifier's output format.
 The external workflow contract checker additionally uses PyYAML; `actionlint`
 provides the Actions schema/expression checks and ShellCheck checks shell blocks.
 

@@ -42,10 +42,19 @@ def check_apk(apk, badging):
 
 
 def certificate_digest(report):
-    values = re.findall(r"^Signer #\d+ certificate SHA-256 digest: ([0-9a-fA-F]{64})$",
-                        report, re.MULTILINE)
-    require(len(values) == 1, "Expected exactly one verified signing certificate")
-    return values[0].lower()
+    lines = report.splitlines()
+    require(lines.count("Verifies") == 1 and "DOES NOT VERIFY" not in lines,
+            "Expected successful apksigner verification")
+    require([line for line in lines if line.startswith("Number of signers:")]
+            == ["Number of signers: 1"], "Expected exactly one verified signer")
+    certificates = [line for line in lines if "certificate SHA-256 digest:" in line]
+    require(len(certificates) == 1, "Expected exactly one verified signing certificate")
+    # Build-tools 37 names the single signer by scheme, not "Signer #1".
+    value = re.fullmatch(
+        r"(?:Signer #1|V(?:1|2|3\.0) Signer:) certificate SHA-256 digest: ([0-9a-fA-F]{64})",
+        certificates[0])
+    require(value is not None, "Unexpected signing certificate report format")
+    return value[1].lower()
 
 
 def source_files(root):
@@ -86,6 +95,7 @@ def collect(core, tooling, output):
     check_apk(apk, badging)
     report = subprocess.check_output(
         [str(sdk / "apksigner"), "verify", "--verbose", "--print-certs", str(apk)], text=True)
+    print(report, end="", flush=True)
     fingerprint = certificate_digest(report)
     output.mkdir(parents=True, exist_ok=False)
     name = f"Chibaheit-SFA-{MANIFEST['app']['version_name']}-arm64-v8a-DEBUG.apk"

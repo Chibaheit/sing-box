@@ -90,7 +90,8 @@ class Patches(unittest.TestCase):
             if executable == "aapt":
                 return fixture.badging
             if executable == "apksigner":
-                return "Signer #1 certificate SHA-256 digest: " + "ab" * 32 + "\n"
+                return ("Verifies\nNumber of signers: 1\n"
+                        "V2 Signer: certificate SHA-256 digest: " + "ab" * 32 + "\n")
             if executable in ("go", "java"):
                 return "SYNTHETIC TEST TOOL OUTPUT\n"
             return real_check_output(args, **kwargs)
@@ -98,6 +99,20 @@ class Patches(unittest.TestCase):
         with patch("collect.provenance", return_value={"synthetic_test": True}), \
                 patch("subprocess.check_output", side_effect=tool_output), \
                 patch.dict(os.environ, {"ANDROID_HOME": "/synthetic-sdk"}):
+            with patch("collect.certificate_digest", side_effect=ValueError("Rejected report")):
+                with self.assertRaisesRegex(ValueError, "Rejected report"):
+                    collect.collect(self.core, CORE_SOURCE, output)
+                self.assertFalse(output.exists())
+
+            def signature_failure(args, **kwargs):
+                if Path(args[0]).name == "apksigner":
+                    raise subprocess.CalledProcessError(1, args, output="DOES NOT VERIFY\n")
+                return tool_output(args, **kwargs)
+
+            with patch("subprocess.check_output", side_effect=signature_failure):
+                with self.assertRaises(subprocess.CalledProcessError):
+                    collect.collect(self.core, CORE_SOURCE, output)
+                self.assertFalse(output.exists())
             collect.collect(self.core, CORE_SOURCE, output)
         expected = {
             "Chibaheit-SFA-1.14.1-chibaheit.1-arm64-v8a-DEBUG.apk",
@@ -229,10 +244,38 @@ class ArtifactChecks(unittest.TestCase):
 
     def test_certificate_report(self):
         line = "Signer #1 certificate SHA-256 digest: " + "AB" * 32 + "\n"
-        self.assertEqual(collect.certificate_digest(line), "ab" * 32)
-        for report in ("", line + line, line.replace("AB", "XY")):
+        header = "Verifies\nNumber of signers: 1\n"
+        self.assertEqual(collect.certificate_digest(header + line), "ab" * 32)
+        for report in ("", header + line + line, header + line.replace("AB", "XY"),
+                       line, header.replace("Verifies", "DOES NOT VERIFY") + line,
+                       header.replace("signers: 1", "signers: 2") + line,
+                       header + "Number of signers: 2\n" + line):
             with self.assertRaises(ValueError):
                 collect.certificate_digest(report)
+
+    def test_build_tools_37_certificate_report(self):
+        report = (prepare.HERE / "fixtures/apksigner-37-single-signer.txt").read_text()
+        expected = "fb5dbd3c669af9fc236c6991e6387b7f11ff0590997f22d0f5c74ff40e04fca8"
+        self.assertEqual(collect.certificate_digest(report), expected)
+        for label in ("V1 Signer:", "V2 Signer:"):
+            with self.subTest(label=label):
+                self.assertEqual(collect.certificate_digest(
+                    report.replace("V3.0 Signer:", label)), expected)
+        line = next(line for line in report.splitlines() if "certificate SHA-256 digest:" in line)
+        for bad in (
+            report.replace("Number of signers: 1", "Number of signers: 2"),
+            report.replace("Number of signers: 1\n", ""),
+            report.replace("Verifies\n", ""),
+            report + line + "\n",
+            report + line.replace("V3.0 Signer:", "V2 Signer #2:") + "\n",
+            report + line.replace("V3.0 Signer:", "V3.1 Signer (minSdkVersion=33):") + "\n",
+            report.replace("V3.0 Signer:", "Source Stamp Signer:"),
+            report.replace(line + "\n", ""),
+            report.replace(expected, expected[:-1]),
+            report.replace(expected, "g" * 64),
+        ):
+            with self.subTest(report=bad), self.assertRaises(ValueError):
+                collect.certificate_digest(bad)
 
 
 class LibboxAPI(unittest.TestCase):
