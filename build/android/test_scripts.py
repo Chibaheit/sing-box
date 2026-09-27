@@ -3,6 +3,7 @@
 
 import argparse
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -20,6 +21,10 @@ import prepare
 CORE_SOURCE = None
 APP_SOURCE = None
 KOTLIN_HOME = None
+
+
+def signer_report():
+    return (prepare.HERE / "fixtures/apksigner-37-single-signer.txt").read_text()
 
 
 def checkout(source, revision, destination):
@@ -90,8 +95,7 @@ class Patches(unittest.TestCase):
             if executable == "aapt":
                 return fixture.badging
             if executable == "apksigner":
-                return ("Verifies\nNumber of signers: 1\n"
-                        "V2 Signer: certificate SHA-256 digest: " + "ab" * 32 + "\n")
+                return signer_report()
             if executable in ("go", "java"):
                 return "SYNTHETIC TEST TOOL OUTPUT\n"
             return real_check_output(args, **kwargs)
@@ -99,14 +103,19 @@ class Patches(unittest.TestCase):
         with patch("collect.provenance", return_value={"synthetic_test": True}), \
                 patch("subprocess.check_output", side_effect=tool_output), \
                 patch.dict(os.environ, {"ANDROID_HOME": "/synthetic-sdk"}):
-            with patch("collect.certificate_digest", side_effect=ValueError("Rejected report")):
+            with patch("collect.certificate_digest", side_effect=ValueError("Rejected report")), \
+                    patch("sys.stdout", new_callable=io.StringIO) as log:
                 with self.assertRaisesRegex(ValueError, "Rejected report"):
                     collect.collect(self.core, CORE_SOURCE, output)
                 self.assertFalse(output.exists())
+                self.assertEqual(log.getvalue(),
+                                 "Rejected public apksigner report: "
+                                 + json.dumps(signer_report(), ensure_ascii=True) + "\n")
 
             def signature_failure(args, **kwargs):
                 if Path(args[0]).name == "apksigner":
-                    raise subprocess.CalledProcessError(1, args, output="DOES NOT VERIFY\n")
+                    # Even successful-looking stdout cannot override a failed verifier.
+                    raise subprocess.CalledProcessError(1, args, output=signer_report())
                 return tool_output(args, **kwargs)
 
             with patch("subprocess.check_output", side_effect=signature_failure):
@@ -122,7 +131,8 @@ class Patches(unittest.TestCase):
         self.assertEqual({p.name for p in output.iterdir()}, expected)
         record = json.loads((output / "source-manifest.json").read_text())
         self.assertTrue(record["synthetic_test"])
-        self.assertEqual(record["certificate_sha256"], "ab" * 32)
+        self.assertEqual(record["certificate_sha256"],
+                         "fb5dbd3c669af9fc236c6991e6387b7f11ff0590997f22d0f5c74ff40e04fca8")
         checksums = (output / "SHA256SUMS").read_text().splitlines()
         self.assertEqual(len(checksums), len(expected) - 1)
         for line in checksums:
@@ -243,24 +253,25 @@ class ArtifactChecks(unittest.TestCase):
                 collect.check_apk(self.apk, self.badging)
 
     def test_certificate_report(self):
-        line = "Signer #1 certificate SHA-256 digest: " + "AB" * 32 + "\n"
-        header = "Verifies\nNumber of signers: 1\n"
-        self.assertEqual(collect.certificate_digest(header + line), "ab" * 32)
-        for report in ("", header + line + line, header + line.replace("AB", "XY"),
-                       line, header.replace("Verifies", "DOES NOT VERIFY") + line,
-                       header.replace("signers: 1", "signers: 2") + line,
-                       header + "Number of signers: 2\n" + line):
+        report = signer_report().replace("V3.0 Signer:", "Signer #1")
+        digest = "fb5dbd3c669af9fc236c6991e6387b7f11ff0590997f22d0f5c74ff40e04fca8"
+        self.assertEqual(collect.certificate_digest(report.replace(digest, digest.upper())), digest)
+        for report in ("", report + report, report.replace(digest, "XY" * 32),
+                       report.replace("Verifies\n", ""),
+                       report.replace("Verifies", "DOES NOT VERIFY"),
+                       report.replace("signers: 1", "signers: 2"),
+                       report + "Number of signers: 2\n"):
             with self.assertRaises(ValueError):
                 collect.certificate_digest(report)
 
     def test_build_tools_37_certificate_report(self):
-        report = (prepare.HERE / "fixtures/apksigner-37-single-signer.txt").read_text()
+        report = signer_report()
         expected = "fb5dbd3c669af9fc236c6991e6387b7f11ff0590997f22d0f5c74ff40e04fca8"
         self.assertEqual(collect.certificate_digest(report), expected)
-        for label in ("V1 Signer:", "V2 Signer:"):
-            with self.subTest(label=label):
+        for name in ("apksigner-37-v1-signer.txt", "apksigner-37-v2-signer.txt"):
+            with self.subTest(fixture=name):
                 self.assertEqual(collect.certificate_digest(
-                    report.replace("V3.0 Signer:", label)), expected)
+                    (prepare.HERE / "fixtures" / name).read_text()), expected)
         line = next(line for line in report.splitlines() if "certificate SHA-256 digest:" in line)
         for bad in (
             report.replace("Number of signers: 1", "Number of signers: 2"),
@@ -273,6 +284,86 @@ class ArtifactChecks(unittest.TestCase):
             report.replace(line + "\n", ""),
             report.replace(expected, expected[:-1]),
             report.replace(expected, "g" * 64),
+        ):
+            with self.subTest(report=bad), self.assertRaises(ValueError):
+                collect.certificate_digest(bad)
+
+    def test_same_signer_across_schemes(self):
+        report = signer_report()
+        records = "".join(line + "\n" for line in report.splitlines()
+                          if line.startswith("V3.0 Signer:"))
+        expected = collect.certificate_digest(report)
+        for label in ("V1 Signer:", "V2 Signer:", "V3.0 Signer:"):
+            with self.subTest(label=label):
+                self.assertEqual(collect.certificate_digest(
+                    report + records.replace("V3.0 Signer:", label)), expected)
+
+    def test_reject_extra_signer_scopes(self):
+        report = signer_report()
+        records = "".join(line + "\n" for line in report.splitlines()
+                          if line.startswith("V3.0 Signer:"))
+        for label in ("Signer #2", "V2 Signer #2:", "V3.0 Signer #2:",
+                      "V3.1 Signer (minSdkVersion=33):", "Source Stamp Signer:"):
+            for extra in ("certificate DN: CN=other",
+                          "certificate SHA-512 digest: " + "cd" * 64,
+                          "key algorithm: EC",
+                          "public key SHA-256 digest: " + "ab" * 32):
+                with self.subTest(label=label, extra=extra), self.assertRaises(ValueError):
+                    collect.certificate_digest(report + f"{label} {extra}\n")
+            with self.subTest(label=label, same_certificate=True), self.assertRaises(ValueError):
+                collect.certificate_digest(report + records.replace("V3.0 Signer:", label))
+
+    def test_reject_conflicting_signer_records(self):
+        report = signer_report()
+        records = "".join(line + "\n" for line in report.splitlines()
+                          if line.startswith("V3.0 Signer:"))
+        for line in records.splitlines():
+            field, value = line.removeprefix("V3.0 Signer: ").split(": ", 1)
+            replacement = ("CN=other" if field == "certificate DN" else
+                           "EC" if field == "key algorithm" else
+                           "4096" if field == "key size (bits)" else "ab" * (len(value) // 2))
+            changed = records.replace(line, f"V3.0 Signer: {field}: {replacement}")
+            for label in ("V3.0 Signer:", "V2 Signer:"):
+                with self.subTest(field=field, label=label), self.assertRaises(ValueError):
+                    collect.certificate_digest(report + changed.replace("V3.0 Signer:", label))
+            with self.subTest(duplicate=field), self.assertRaises(ValueError):
+                collect.certificate_digest(report + f"V3.0 Signer: {field}: {replacement}\n")
+
+    def test_reject_incomplete_or_unknown_records(self):
+        report = signer_report()
+        for line in report.splitlines():
+            if not line.startswith("V3.0 Signer:"):
+                continue
+            with self.subTest(missing=line), self.assertRaises(ValueError):
+                collect.certificate_digest(report.replace(line + "\n", ""))
+            with self.subTest(empty=line), self.assertRaises(ValueError):
+                collect.certificate_digest(report.replace(line, line.rsplit(": ", 1)[0] + ": "))
+        for extra in ("V2 Signer: certificate DN: CN=other",
+                      "V2 Signer: certificate SHA-512 digest: " + "ab" * 64,
+                      "V3.0 Signer: certificate SHA-512 digest: " + "ab" * 64,
+                      "V3.0 Signer: public key algorithm: EC",
+                      "certificate DN: CN=unscoped", "unrecognized output",
+                      "V3.0 Signer: key algorithm: RSA"):
+            with self.subTest(extra=extra), self.assertRaises(ValueError):
+                collect.certificate_digest(report + extra + "\n")
+        with self.assertRaises(ValueError):
+            collect.certificate_digest(report.replace("CN=rsa-2048", "CN=test\x1b[31m"))
+
+    def test_reject_ambiguous_headers_and_layout(self):
+        report = signer_report()
+        records = "".join(line + "\n" for line in report.splitlines()
+                          if line.startswith("V3.0 Signer:"))
+        for bad in (
+            report + records.replace("V3.0 Signer:", "Signer #1"),
+            report.replace("V3.0 Signer: key algorithm:", "V2 Signer: key algorithm:"),
+            report.replace("Number of signers: 1\n", "") + "Number of signers: 1\n",
+            report.replace("Verified for SourceStamp: false", "Verified for SourceStamp: true"),
+            report.replace("Scheme v3.1): false", "Scheme v3.1): true"),
+            report.replace("Scheme v3.2): false", "Scheme v3.2): true"),
+            report.replace("Verifies\n", "Verifies\nVerified for SourceStamp: false\n"),
+            report.replace("Verifies\n",
+                           "Verifies\nVerified using v2 scheme (APK Signature Scheme v2): false\n"),
+            report + "WARNING: unknown signing report warning\n",
         ):
             with self.subTest(report=bad), self.assertRaises(ValueError):
                 collect.certificate_digest(bad)
