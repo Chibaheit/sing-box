@@ -1,0 +1,41 @@
+diff --git a/app/src/main/java/io/nekohasekai/sfa/bg/BoxService.kt b/app/src/main/java/io/nekohasekai/sfa/bg/BoxService.kt
+--- a/app/src/main/java/io/nekohasekai/sfa/bg/BoxService.kt
++++ b/app/src/main/java/io/nekohasekai/sfa/bg/BoxService.kt
+@@ -96,6 +96,6 @@
+     private fun startCommandServer() {
+         Libbox.promoteOOMDraft()
+-        Libbox.promotePowerReportDraft()
++        Libbox.discardPowerReportDraft()
+         val commandServer = CommandServer(this, platformInterface)
+         commandServer.start()
+         this.commandServer = commandServer
+@@ -293,7 +293,7 @@
+                 close()
+ //                Seq.destroyRef(refnum)
+             }
+-            Libbox.promotePowerReportDraft()
++            Libbox.discardPowerReportDraft()
+             PowerReportManager.refresh()
+             Settings.startedByUser = false
+             withContext(Dispatchers.Main) {
+diff --git a/app/src/main/java/io/nekohasekai/sfa/bg/PlatformInterfaceWrapper.kt b/app/src/main/java/io/nekohasekai/sfa/bg/PlatformInterfaceWrapper.kt
+--- a/app/src/main/java/io/nekohasekai/sfa/bg/PlatformInterfaceWrapper.kt
++++ b/app/src/main/java/io/nekohasekai/sfa/bg/PlatformInterfaceWrapper.kt
+@@ -9,6 +9,8 @@
+ import android.system.OsConstants
+ import android.util.Log
+ import androidx.annotation.RequiresApi
++import io.nekohasekai.libbox.AutoRedirectHandler
++import io.nekohasekai.libbox.AutoRedirectSession
+ import io.nekohasekai.libbox.BridgeOptions
+ import io.nekohasekai.libbox.BridgeSession
+ import io.nekohasekai.libbox.ConnectionOwner
+@@ -47,2 +49,8 @@
+ interface PlatformInterfaceWrapper : PlatformInterface {
++    override fun usePlatformAutoRedirect(): Boolean = false
++
++    override fun createAutoRedirect(options: ByteArray?, handler: AutoRedirectHandler?): AutoRedirectSession {
++        throw UnsupportedOperationException("Platform auto-redirect is not supported by this build")
++    }
++
+     override fun usePlatformAutoDetectInterfaceControl(): Boolean = true

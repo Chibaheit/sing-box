@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline script tests using isolated checkouts and explicitly synthetic ZIPs."""
+"""Offline patch/ZIP tests and an optional, projected Kotlin ABI compiler test."""
 
 import argparse
 import hashlib
@@ -19,6 +19,7 @@ import prepare
 
 CORE_SOURCE = None
 APP_SOURCE = None
+KOTLIN_HOME = None
 
 
 def checkout(source, revision, destination):
@@ -152,6 +153,17 @@ class Patches(unittest.TestCase):
                       (self.core / "experimental/libbox/service.go").read_text())
         self.assertIn("return platformInterface.AutoDetectInterfaceControl(int(fileDescriptor))",
                       (self.core / "protocol/tailscale/system_binding.go").read_text())
+        box = (app / "app/src/main/java/io/nekohasekai/sfa/bg/BoxService.kt").read_text()
+        self.assertNotIn("promotePowerReportDraft", box)
+        self.assertEqual(box.count("Libbox.discardPowerReportDraft()"), 2)
+        self.assertIn("func DiscardPowerReportDraft()",
+                      (self.core / "experimental/libbox/power_report.go").read_text())
+        wrapper = (app / "app/src/main/java/io/nekohasekai/sfa/bg/PlatformInterfaceWrapper.kt").read_text()
+        self.assertIn("override fun usePlatformAutoRedirect(): Boolean = false", wrapper)
+        self.assertIn("override fun createAutoRedirect(options: ByteArray?, "
+                      "handler: AutoRedirectHandler?): AutoRedirectSession", wrapper)
+        self.assertIn('throw UnsupportedOperationException("Platform auto-redirect is not '
+                      'supported by this build")', wrapper)
         builder = (self.core / "cmd/internal/build_libbox/main.go").read_text()
         tags = []
         for line in builder.splitlines():
@@ -223,11 +235,109 @@ class ArtifactChecks(unittest.TestCase):
                 collect.certificate_digest(report)
 
 
+class LibboxAPI(unittest.TestCase):
+    def test_pinned_kotlin_api_seam(self):
+        if KOTLIN_HOME is None:
+            self.skipTest("Pass --kotlin-home for the narrow Kotlin compiler regression")
+        java_home = Path(os.environ["JAVA_HOME"])
+        with tempfile.TemporaryDirectory(prefix="libbox-api-test-") as temporary:
+            root = Path(temporary)
+            core = root / "core"
+            app = core / prepare.MANIFEST["app"]["path"]
+            checkout(CORE_SOURCE, prepare.MANIFEST["core"]["revision"], core)
+            checkout(APP_SOURCE, prepare.MANIFEST["app"]["revision"], app)
+            prepare.apply(core)
+
+            # Project only the failed ABI seam, not Android services or an APK.
+            platform = (core / "experimental/libbox/platform.go").read_text()
+            self.assertIn("UsePlatformAutoRedirect() bool", platform)
+            self.assertIn("CreateAutoRedirect(options []byte, handler AutoRedirectHandler) "
+                          "(AutoRedirectSession, error)", platform)
+            reports = (core / "experimental/libbox/power_report.go").read_text()
+            report_functions = re.findall(r"^func ([A-Z]\w*)\(\) \{", reports, re.MULTILINE)
+            self.assertEqual(report_functions, ["DiscardPowerReportDraft"])
+            java_sources = {
+                "PlatformInterface": (
+                    "public interface PlatformInterface {\n"
+                    "boolean usePlatformAutoRedirect();\n"
+                    "AutoRedirectSession createAutoRedirect(byte[] options, "
+                    "AutoRedirectHandler handler) throws Exception;\n}"
+                ),
+                "AutoRedirectHandler": "public interface AutoRedirectHandler {}",
+                "AutoRedirectSession": "public interface AutoRedirectSession {}",
+                "Libbox": (
+                    "public class Libbox {\npublic static int calls;\n"
+                    + "\n".join(f"public static void {name[0].lower() + name[1:]}() "
+                                "{ calls++; }" for name in report_functions)
+                    + "\n}"
+                ),
+            }
+            for name, source in java_sources.items():
+                (root / f"{name}.java").write_text("package io.nekohasekai.libbox;\n" + source)
+            classes = root / "classes"
+            subprocess.run([str(java_home / "bin/javac"), "-d", str(classes),
+                            *map(str, sorted(root.glob("*.java")))], check=True)
+            bg = app / "app/src/main/java/io/nekohasekai/sfa/bg"
+            wrapper = (bg / "PlatformInterfaceWrapper.kt").read_text()
+            overrides = re.findall(
+                r"    override fun (?:usePlatformAutoRedirect|createAutoRedirect)\b[^\n]*"
+                r"(?:\n        [^\n]*|\n    \})*", wrapper,
+            )
+            box = (bg / "BoxService.kt").read_text()
+            calls = re.findall(r"Libbox\.\w*PowerReportDraft\(\)", box)
+            self.assertEqual(len(calls), 2)
+            for name in ("ProxyService", "VPNService"):
+                self.assertIn("PlatformInterfaceWrapper", (bg / f"{name}.kt").read_text())
+            seam = root / "Seam.kt"
+            seam.write_text(
+                "import io.nekohasekai.libbox.*\n"
+                "interface PlatformInterfaceWrapper : PlatformInterface {\n"
+                + "\n".join(overrides) + "\n}\n"
+                "class ProxyService : PlatformInterfaceWrapper\n"
+                "class VPNService : PlatformInterfaceWrapper\n"
+                "fun main() {\n"
+                + "\n".join(calls) + "\n"
+                "check(Libbox.calls == 2)\n"
+                "for (service in listOf(ProxyService(), VPNService())) {\n"
+                "check(!service.usePlatformAutoRedirect())\n"
+                "try {\n"
+                "service.createAutoRedirect(byteArrayOf(), object : AutoRedirectHandler {})\n"
+                'error("Unsupported auto-redirect unexpectedly succeeded")\n'
+                "} catch (expected: UnsupportedOperationException) {\n"
+                'check(expected.message == "Platform auto-redirect is not supported by this build")\n'
+                "}\n}\n}\n"
+            )
+            compiler = [str(java_home / "bin/java"), "-Xmx512m", "-cp",
+                        str(KOTLIN_HOME / "lib/*"), "org.jetbrains.kotlin.cli.jvm.K2JVMCompiler"]
+            version = subprocess.run([*compiler, "-version"], text=True, capture_output=True,
+                                     check=True)
+            self.assertIn("kotlinc-jvm " + prepare.MANIFEST["toolchain"]["kotlin"],
+                          version.stdout + version.stderr)
+            result = subprocess.run(
+                [*compiler, "-no-stdlib", "-no-reflect", "-jvm-target", "17",
+                 "-classpath", os.pathsep.join((str(classes),
+                                               str(KOTLIN_HOME / "lib/kotlin-stdlib.jar"))),
+                 "-d", str(root / "seam.jar"), str(seam)],
+                text=True, capture_output=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            subprocess.run(
+                [str(java_home / "bin/java"), "-cp",
+                 os.pathsep.join((str(root / "seam.jar"), str(classes),
+                                  str(KOTLIN_HOME / "lib/kotlin-stdlib.jar"))), "SeamKt"],
+                check=True,
+            )
+            print("Pinned Kotlin ABI seam compiles; both services reject unsupported auto-redirect")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--core-source", required=True, type=Path)
     parser.add_argument("--app-source", required=True, type=Path)
+    parser.add_argument("--kotlin-home", type=Path,
+                        help="Optional Kotlin compiler distribution; requires JAVA_HOME (JDK 17)")
     args, remaining = parser.parse_known_args()
     CORE_SOURCE = args.core_source.resolve()
     APP_SOURCE = args.app_source.resolve()
+    KOTLIN_HOME = args.kotlin_home.resolve() if args.kotlin_home else None
     unittest.main(argv=[__file__, *remaining])

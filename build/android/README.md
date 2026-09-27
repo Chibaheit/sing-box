@@ -5,8 +5,9 @@ Recommended first trial: fork core `4a39ff496a245e1864cdbe608cab09f5d17df9bc`
 and its exact `clients/android` gitlink
 `a3668ae6e4bbcb3ceff8461d0cac55d79edf504f`. The app's baseline is **1.14.1,
 versionCode 734**, customized as **1.14.1-chibaheit.1**. It is not official
-1.14.2. Pairing the fork with its recorded app avoids an unreviewed core/app
-upgrade. Neither `testing` nor other PRs are synchronized by this recipe.
+1.14.2. Using the recorded gitlink avoids an unreviewed core/app upgrade, but
+does not guarantee API compatibility: the first hosted build exposed the drift
+documented below. Neither `testing` nor other PRs are synchronized by this recipe.
 
 Official 1.14.2 would instead require reviewing core
 `af6e64c3b69e6132ebaee0e1a3d24e93903f6709` with app
@@ -43,6 +44,14 @@ Do not omit this directive or combine the install with unrelated commits.
 Do not paste the unified diff into the YAML editor. The patch is an
 alternative review/application format, not a credential-scope workaround.
 The tooling PR can remain unmerged: the workflow fetches its immutable commit.
+
+For an already installed workflow, deliver a new revision-named YAML and a diff
+against the installed file; do not overwrite the original delivery. The user
+must manually **edit** `.github/workflows/custom-android.yml` on `testing` to
+update the tooling pin, using **`Update pinned custom Android tooling [skip ci]`**.
+Do not push that edit with this credential. Re-running the old failed run still
+uses its old immutable tooling pin; only a new run after the manual update can
+consume the fix.
 
 Only **after that manual commit**, use Actions > **Custom Android DEBUG trial**
 > Run workflow, selecting `testing`. Equivalently, the already-authorized hosted
@@ -126,6 +135,18 @@ are not semantic versions. This tag is never pushed. No
    SagerNet gomobile's pinned `bind/genjava.go` transports Java exceptions into
    Go errors via `go_seq_get_exception` in `bind/java/seq_android.c.support`.
    This is a narrowly justified fail-closed change, **not proof of phone behavior**.
+5. Pinned libbox API compatibility: replace the two stale power-report promotion
+   calls with `discardPowerReportDraft`, as upstream app commit
+   `38c102a46990077d94dc53c4350b4d86ef8e373b` does. Core commit
+   `153c0cc32ba12234861ee541dc21d7e8b4c6a2be` removed promotion in favor of
+   discarding unfinished drafts; completed reports are still finalized by
+   `Recorder.Close`. Explicitly return false for `usePlatformAutoRedirect` and
+   throw on `createAutoRedirect`: this pinned app has no root auto-redirect
+   Binder implementation. The core's platform stub uses the same capability
+   pattern. This preserves the non-root `VpnService` trial and does not implement
+   root auto-redirect or silently create a successful session. The approved
+   Android configuration excludes `auto_redirect`; supporting the newer root
+   feature would require a separately reviewed app upgrade/backport, not this fix.
 
 Provider authorities (`.cache`, `.workingdir`, `.XposedService`, `.shizuku`)
 already use `${applicationId}`; callers use runtime package names or
@@ -183,6 +204,33 @@ request passwords, provision secrets, preserve keys, or claim production signing
 
 ## Validation and upgrade procedure
 
+### First hosted build: iteration 1
+
+Run `36280746159`, job `108511965012`, completed both arm64 libbox AARs and
+entered Gradle 9.7.0. Its first actual errors were:
+
+```text
+2026-09-27T00:00:29.5792265Z BoxService.kt:98:16 Unresolved reference 'promotePowerReportDraft'.
+2026-09-27T00:00:29.5801664Z BoxService.kt:296:20 Unresolved reference 'promotePowerReportDraft'.
+2026-09-27T00:00:29.5803662Z > Task :app:compileOtherDebugKotlin FAILED
+```
+
+The same compilation reported that both `ProxyService` and `VPNService` lacked
+`createAutoRedirect(ByteArray!, AutoRedirectHandler!): AutoRedirectSession!`
+and `usePlatformAutoRedirect(): Boolean`. These are core/app API drift, not
+Node/setup-java/AGP deprecation warnings or an AAR compiler failure. No APK was
+verified or uploaded; the run's artifact count was **0**.
+
+The optional compiler regression below uses Kotlin **2.4.10** and a JDK **17**.
+It projects the actual patched app calls and override bodies into a small JVM
+fixture, with Java ABI declarations checked against the pinned Go declarations.
+It reproduces all of the above Kotlin errors before patch 0004, compiles after
+the patch, and executes both service projections to verify that unsupported
+auto-redirect throws. It does **not** compile complete Android services, generate
+an AAR, assemble an APK, or prove on-device behavior.
+
+### Local checks
+
 The script suite needs Python 3.10+ and Git, with an existing local copy of both
 source objects; it fetches them into isolated temporary repositories:
 
@@ -193,6 +241,16 @@ bash -n build/android/build.sh
 shellcheck build/android/build.sh
 actionlint /outside/repo/delivery/custom-android.yml
 python3 build/android/validate_workflow.py /outside/repo/delivery/custom-android.yml
+```
+
+To also run the narrow compiler regression, supply an existing Kotlin 2.4.10
+compiler distribution (no SDK, NDK, Gradle or full local build is needed):
+
+```sh
+JAVA_HOME=/path/to/jdk-17 PYTHONDONTWRITEBYTECODE=1 \
+  python3 build/android/test_scripts.py \
+  --core-source . --app-source clients/android \
+  --kotlin-home /path/to/kotlinc -v
 ```
 
 The tests show RED on pristine sources and GREEN after the complete patch layer,
