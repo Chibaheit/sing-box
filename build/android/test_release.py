@@ -31,6 +31,15 @@ def workflow_build_job():
 
 
 class ReleaseContract(unittest.TestCase):
+    def test_hosted_runtime_tests_are_explicit_and_gradle_is_optional(self):
+        steps = workflow_build_job()["steps"]
+        test_step = next(step for step in steps
+                         if step.get("name") == "Test source patches and artifact rejection cases")
+        self.assertEqual(test_step["run"].splitlines()[-1],
+                         "python3 tooling/build/android/test_runtime.py -v")
+        self.assertNotIn("GRADLE", test_step["run"])
+        self.assertNotIn("env", test_step)
+
     def test_release_manifest(self):
         app = prepare.MANIFEST["app"]
         self.assertEqual(app["gradle_task"], ":app:assembleOtherRelease")

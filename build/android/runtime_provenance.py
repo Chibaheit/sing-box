@@ -31,6 +31,42 @@ URL = re.compile(r"(?<![a-z0-9+.-])[a-z][a-z0-9+.-]*://[^\s<>\"'`\\]+", re.I | r
 SECRET_KEY = re.compile(
     r"(?:^|[_ -])(?:secret|token|password|passwd|pwd|credential|credentials|auth|authorization|"
     r"signature|sig|key|apikey|accesskey|privatekey|accesstoken|authtoken)(?:$|[_ -])", re.I)
+DIAGNOSTIC_MAX_INTEGER = 2**63 - 1
+DIAGNOSTIC_PHASES = {
+    "invocation", "prepare", "limits", "graph_read", "graph_scan", "graph_decode",
+    "entry", "raw_scan", "zip_inspection", "publication",
+}
+DIAGNOSTIC_REASONS = {
+    "invalid_input", "io_error", "unexpected_error", "invalid_zip",
+    "credential_url", "unparseable_url", "budget_exceeded",
+}
+DIAGNOSTIC_FIELDS = {"capture", "graph", "required_artifacts", "supplements"}
+
+
+def diagnostic_record(context, error):
+    if isinstance(error, EvidenceRejected):
+        error = error.problem
+    reason = (error.reason if isinstance(error, (UnsafeEvidence, EvidenceLimit)) else
+              "io_error" if isinstance(error, OSError) else
+              "invalid_input" if isinstance(error, (ValueError, KeyError, TypeError)) else
+              "unexpected_error")
+    phase = getattr(error, "phase", None) or context.get("phase")
+    record = {
+        "schema": 1,
+        "phase": phase if phase in DIAGNOSTIC_PHASES else "invocation",
+        "reason": reason if reason in DIAGNOSTIC_REASONS else "unexpected_error",
+        "field": context.get("field") if context.get("field") in DIAGNOSTIC_FIELDS else "capture",
+    }
+    index = context.get("index")
+    if type(index) is int and index >= 0:
+        record["index"] = min(index, DIAGNOSTIC_MAX_INTEGER)
+    digest = context.get("sha256")
+    if isinstance(digest, str) and re.fullmatch("[0-9a-f]{64}", digest):
+        record["sha256"] = digest
+    if isinstance(error, EvidenceLimit) and error.key in DEFAULT_LIMITS:
+        record.update(budget=error.key, count=min(error.count, DIAGNOSTIC_MAX_INTEGER),
+                      limit=min(error.limit, DIAGNOSTIC_MAX_INTEGER))
+    return record
 
 
 def safe_path(path, root=None):
@@ -56,7 +92,9 @@ def prepare_capture(capture):
 
 
 class Budget:
-    def __init__(self):
+    def __init__(self, diagnostic=None):
+        self.diagnostic = diagnostic if diagnostic is not None else {}
+        self.diagnostic.update(phase="limits", field="capture")
         overrides = json.loads(os.environ.get("RUNTIME_PROVENANCE_LIMITS", "{}"))
         require(isinstance(overrides, dict) and overrides.keys() <= DEFAULT_LIMITS.keys(),
                 "Invalid runtime limits")
@@ -66,7 +104,7 @@ class Budget:
 
     def check(self, key, count):
         if count > self.limits[key]:
-            raise EvidenceLimit("Runtime evidence limit exceeded: " + key)
+            raise EvidenceLimit(key, count, self.limits[key], self.diagnostic.get("phase"))
 
     def add(self, key, count):
         self.used[key] = self.used.get(key, 0) + count
@@ -74,11 +112,24 @@ class Budget:
 
 
 class UnsafeEvidence(ValueError):
-    pass
+    def __init__(self, message, reason, phase=None):
+        super().__init__(message)
+        self.reason = reason
+        self.phase = phase
 
 
 class EvidenceLimit(ValueError):
-    pass
+    reason = "budget_exceeded"
+
+    def __init__(self, key, count, limit, phase):
+        super().__init__("Runtime evidence limit exceeded: " + key)
+        self.key, self.count, self.limit, self.phase = key, count, limit, phase
+
+
+class EvidenceRejected(ValueError):
+    def __init__(self, problem):
+        super().__init__("Required/public evidence rejected: " + str(problem))
+        self.problem = problem
 
 
 def check_urls(text):
@@ -91,14 +142,14 @@ def check_urls(text):
         try:
             parsed = urlsplit(url)
         except ValueError:
-            raise UnsafeEvidence("unparseable evidence URL") from None
+            raise UnsafeEvidence("unparseable evidence URL", "unparseable_url") from None
         if "@" in parsed.netloc:
-            raise UnsafeEvidence("credential-bearing URL")
+            raise UnsafeEvidence("credential-bearing URL", "credential_url")
         for field in re.split(r"[&;]", parsed.query + "&" + parsed.fragment):
             key = unquote(field.split("=", 1)[0]).replace("+", " ")
             key = re.sub(r"([a-z])([A-Z])", r"\1_\2", key)
             if SECRET_KEY.search(key):
-                raise UnsafeEvidence("credential-bearing URL")
+                raise UnsafeEvidence("credential-bearing URL", "credential_url")
     return text
 
 
@@ -130,7 +181,7 @@ def scan(stream, budget, *, archive=False, collect=False, sink=None):
 def zip_preflight(stream, budget, depth, expected=False):
     def valid(condition):
         if not condition:
-            raise UnsafeEvidence("Invalid or unsupported ZIP evidence")
+            raise UnsafeEvidence("Invalid or unsupported ZIP evidence", "invalid_zip")
 
     stream.seek(0, os.SEEK_END)
     length = stream.tell()
@@ -236,20 +287,27 @@ def inspect_zip(stream, budget, depth=1, prefix="", expected=False):
 
 
 def inspect(path, budget):
+    budget.diagnostic["phase"] = "raw_scan"
     budget.add("evidence_bytes", path.stat().st_size)
     with path.open("rb") as stream:
         digest, _, unsafe, _ = scan(stream, budget)
+        if unsafe:
+            unsafe.phase = "raw_scan"
+        budget.diagnostic["phase"] = "zip_inspection"
         try:
             notices, problem = inspect_zip(stream, budget)
             unsafe = unsafe or problem
         except (UnsafeEvidence, EvidenceLimit) as problem:
-            notices, unsafe = [], unsafe or UnsafeEvidence(str(problem))
+            notices, unsafe = [], unsafe or problem
         except (zipfile.BadZipFile, NotImplementedError, RuntimeError, EOFError, zlib.error):
-            notices, unsafe = [], UnsafeEvidence("Invalid or unsupported ZIP evidence")
+            notices, unsafe = [], UnsafeEvidence("Invalid or unsupported ZIP evidence", "invalid_zip")
+        if unsafe and unsafe.phase is None:
+            unsafe.phase = "zip_inspection"
     return digest, notices, unsafe
 
 
 def load_capture(capture, budget, graph_name="graph.json"):
+    budget.diagnostic.update(phase="graph_read", field="graph")
     capture = safe_path(capture)
     for name in ("files", "notices", "index.json"):
         safe_path(capture / name, capture)
@@ -257,7 +315,9 @@ def load_capture(capture, budget, graph_name="graph.json"):
     require(graph.is_file(), "Same-build runtime graph missing")
     budget.check("graph_bytes", graph.stat().st_size)
     data = graph.read_bytes()
+    budget.diagnostic["phase"] = "graph_scan"
     check_urls(data.decode("utf-8"))
+    budget.diagnostic["phase"] = "graph_decode"
     return capture, graph, json.loads(data)
 
 
@@ -279,13 +339,22 @@ def validate_entries(capture, record, budget, omit_optional=False):
     allowed = {}
     notices = []
     missing_notices = []
-    for optional, entry in [(False, e) for e in required] + [
-            (True, e) for e in record["supplements"]]:
+    for optional, index, entry in [(False, i, e) for i, e in enumerate(required)] + [
+            (True, i, e) for i, e in enumerate(record["supplements"])]:
+        budget.diagnostic.update(phase="entry",
+                                 field="supplements" if optional else "required_artifacts",
+                                 index=index)
+        budget.diagnostic.pop("sha256", None)
+        if isinstance(entry, dict):
+            digest = entry.get("sha256")
+            if isinstance(digest, str) and re.fullmatch("[0-9a-f]{64}", digest):
+                budget.diagnostic["sha256"] = digest
         path = evidence_path(capture, entry)
         digest = entry["sha256"]
         if digest not in checked:
             checked[digest] = inspect(path, budget)
         actual, embedded, unsafe = checked[digest]
+        budget.diagnostic["phase"] = "entry"
         require(actual == digest, "Captured artifact missing or changed")
         if unsafe:
             if optional and omit_optional:
@@ -293,7 +362,7 @@ def validate_entries(capture, record, budget, omit_optional=False):
                     "component": entry.get("component"), "kind": entry.get("kind"),
                     "sha256": digest, "reason": str(unsafe)})
                 continue
-            raise ValueError("Required/public evidence rejected: " + str(unsafe))
+            raise EvidenceRejected(unsafe)
         if optional:
             kept.append(entry)
         if entry["file"] in allowed:
@@ -309,10 +378,12 @@ def validate_entries(capture, record, budget, omit_optional=False):
     return allowed, notices, missing_notices
 
 
-def sanitize_capture(capture):
-    budget = Budget()
+def sanitize_capture(capture, diagnostic=None):
+    budget = Budget(diagnostic)
     capture, _, record = load_capture(capture, budget, "graph.pending.json")
     validate_entries(capture, record, budget, omit_optional=True)
+    budget.diagnostic.clear()
+    budget.diagnostic.update(phase="publication", field="graph")
     graph = safe_path(capture / "graph.json", capture)
     require(not graph.exists(), "Graph output already exists")
     with graph.open("x") as stream:
@@ -366,14 +437,22 @@ def archive(capture, output):
             "missing": record["supplemental_missing"], "certified": False}
 
 
-if __name__ == "__main__":
+def main(argv):
+    diagnostic = {"phase": "invocation", "field": "capture"}
     try:
-        require(len(sys.argv) == 3 and sys.argv[1] in ("--prepare", "--sanitize"),
+        require(len(argv) == 3 and argv[1] in ("--prepare", "--sanitize"),
                 "Invalid runtime validator invocation")
-        if sys.argv[1] == "--prepare":
-            prepare_capture(Path(sys.argv[2]))
+        if argv[1] == "--prepare":
+            diagnostic["phase"] = "prepare"
+            prepare_capture(Path(argv[2]))
         else:
-            sanitize_capture(Path(sys.argv[2]))
-    except (ValueError, OSError, KeyError, TypeError, zipfile.BadZipFile, RuntimeError):
-        # Malformed inputs and OS/ZIP exceptions may contain private paths or evidence.
-        sys.exit("Runtime evidence validation failed; no public graph published")
+            sanitize_capture(Path(argv[2]), diagnostic)
+    except Exception as error:
+        # Never expose exception text, including for unforeseen interpreter/library failures.
+        print(json.dumps(diagnostic_record(diagnostic, error), separators=(",", ":")), file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

@@ -1,4 +1,5 @@
 import groovy.json.JsonOutput
+import groovy.json.JsonSlurper
 import java.security.MessageDigest
 import org.gradle.api.artifacts.component.ModuleComponentIdentifier
 import org.gradle.api.artifacts.result.ResolvedDependencyResult
@@ -16,9 +17,50 @@ gradle.projectsEvaluated {
         it.name == 'runtime.init.gradle'
     }.parentFile, 'runtime_provenance.py')
     def validate = { mode ->
-        app.providers.exec {
+        def child = app.providers.exec {
             commandLine 'python3', validator.absolutePath, mode, out.absolutePath
-        }.result.get().assertNormalExitValue()
+            ignoreExitValue = true
+        }
+        if (child.result.get().exitValue != 0) {
+            def diagnostic = [schema: 1, phase: mode == '--prepare' ? 'prepare' : 'invocation',
+                              reason: 'child_failure', field: 'capture']
+            byte[] bytes = child.standardError.asBytes.get()
+            if (bytes.length <= 1024) {
+                try {
+                    def value = new JsonSlurper().parseText(new String(bytes, 'UTF-8'))
+                    def integer = { n ->
+                        (n instanceof Integer || n instanceof Long || n instanceof BigInteger) &&
+                            n >= 0 && n <= Long.MAX_VALUE
+                    }
+                    def budgets = ['archive_members', 'capture_members', 'member_bytes', 'archive_bytes',
+                        'capture_bytes', 'evidence_bytes', 'notice_member_bytes', 'notice_bytes',
+                        'graph_bytes', 'archive_depth', 'archive_directory_bytes', 'capture_directory_bytes']
+                    def keys = ['schema', 'phase', 'reason', 'field', 'index', 'sha256', 'budget', 'count', 'limit']
+                    if (value instanceof Map && value.keySet().every { it in keys } &&
+                        value.schema instanceof Integer && value.schema == 1 &&
+                        value.phase in ['invocation', 'prepare', 'limits', 'graph_read', 'graph_scan',
+                            'graph_decode', 'entry', 'raw_scan', 'zip_inspection', 'publication'] &&
+                        value.reason in ['invalid_input', 'io_error', 'unexpected_error', 'invalid_zip',
+                            'credential_url', 'unparseable_url', 'budget_exceeded'] &&
+                        value.field in ['capture', 'graph', 'required_artifacts', 'supplements'] &&
+                        (!value.containsKey('index') || integer(value.index)) &&
+                        (!value.containsKey('sha256') ||
+                            (value.sha256 instanceof String && value.sha256 ==~ /[0-9a-f]{64}/)) &&
+                        (value.reason == 'budget_exceeded' ?
+                            (value.budget in budgets && integer(value.count) && integer(value.limit) &&
+                                value.limit > 0 && value.count >= value.limit) :
+                            !['budget', 'count', 'limit'].any { value.containsKey(it) }) &&
+                        // Reject trailing text, duplicate keys, alternate encodings and extra output.
+                        JsonOutput.toJson(value) == new String(bytes, 'UTF-8').trim()) {
+                        diagnostic = value
+                    }
+                } catch (Exception ignored) {
+                    // Child output is untrusted; even parser exceptions stay private.
+                }
+            }
+            app.logger.error('RUNTIME_DIAGNOSTIC ' + JsonOutput.toJson(diagnostic))
+            throw new GradleException('Runtime evidence validation failed; no public graph published')
+        }
     }
     // Invalidate only owned graphs, after checking ancestors; never delete a tree.
     validate('--prepare')

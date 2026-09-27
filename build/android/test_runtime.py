@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Real Gradle synthetic Maven integration; no Android build or APK claim."""
 import hashlib
+import contextlib
 import functools
 import http.server
 import io
@@ -376,8 +377,212 @@ class RuntimeSafety(unittest.TestCase):
             self.assertEqual(len(index["notices"]), 1)
             self.assertEqual(index["notices"][0]["member"], "classes.jar!/META-INF/LICENSE")
 
+    def cli_diagnostic(self, expected):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            result = runtime_provenance.main(["runtime_provenance.py", "--sanitize", str(self.capture)])
+        self.assertEqual(result, 1)
+        text = stderr.getvalue()
+        self.assertLessEqual(len(text.encode()), 1024)
+        self.assertNotIn("PRIVATE_SENTINEL", text)
+        self.assertNotIn(str(self.capture), text)
+        self.assertNotIn("example.invalid", text)
+        self.assertFalse((self.capture / "graph.json").exists())
+        diagnostic = json.loads(text)
+        for key, value in expected.items():
+            self.assertEqual(diagnostic[key], value)
+        return diagnostic
+
+    def test_cli_graph_and_unforeseen_errors_are_private(self):
+        record, _ = self.evidence(b"ordinary")
+        self.pending(record)
+        pending = self.capture / "graph.pending.json"
+        for data, phase, reason in [
+            (b'{"PRIVATE_SENTINEL":', "graph_decode", "invalid_input"),
+            (b'{"x":"https://example.invalid/?token=PRIVATE_SENTINEL"}',
+             "graph_scan", "credential_url"),
+            (b'{"x":"https://[PRIVATE_SENTINEL"}', "graph_scan", "unparseable_url"),
+            (b"\xffPRIVATE_SENTINEL", "graph_scan", "invalid_input"),
+        ]:
+            with self.subTest(phase=phase, reason=reason):
+                pending.write_bytes(data)
+                diagnostic = self.cli_diagnostic({"phase": phase, "reason": reason, "field": "graph"})
+                self.assertNotIn("sha256", diagnostic)
+                self.assertNotIn("index", diagnostic)
+        pending.unlink()
+        self.cli_diagnostic({"phase": "graph_read", "reason": "invalid_input"})
+        for error, reason in [(OSError("PRIVATE_SENTINEL"), "io_error"),
+                              (RuntimeError("PRIVATE_SENTINEL"), "unexpected_error"),
+                              (AssertionError("PRIVATE_SENTINEL"), "unexpected_error")]:
+            with patch.object(runtime_provenance, "load_capture", side_effect=error):
+                self.cli_diagnostic({"reason": reason})
+
+    def test_cli_budget_metadata_and_bounds(self):
+        record, entry = self.evidence(self.zipped([("one", b""), ("two", b""), ("three", b"")]))
+        self.pending(record)
+        with patch.dict(os.environ, {"RUNTIME_PROVENANCE_LIMITS": '{"archive_members":2}'}):
+            self.cli_diagnostic({"reason": "budget_exceeded", "budget": "archive_members",
+                                 "count": 3, "limit": 2, "sha256": entry["sha256"],
+                                 "field": "required_artifacts", "index": 0,
+                                 "phase": "zip_inspection"})
+        maximum = runtime_provenance.DIAGNOSTIC_MAX_INTEGER
+        error = runtime_provenance.EvidenceLimit("capture_bytes", maximum + 2, maximum + 1, "raw_scan")
+        diagnostic = runtime_provenance.diagnostic_record(
+            {"field": "PRIVATE_SENTINEL", "sha256": "PRIVATE_SENTINEL", "index": maximum + 1}, error)
+        self.assertEqual(diagnostic["count"], maximum)
+        self.assertEqual(diagnostic["limit"], maximum)
+        self.assertEqual(diagnostic["index"], maximum)
+        self.assertEqual(diagnostic["field"], "capture")
+        self.assertNotIn("sha256", diagnostic)
+
+    def test_cli_entry_index_digest_and_publication_context(self):
+        record, _ = self.evidence(b"safe")
+        record["local_aars"] = [{"sha256": "PRIVATE_SENTINEL", "file": "PRIVATE_SENTINEL"}]
+        self.pending(record)
+        diagnostic = self.cli_diagnostic({"phase": "entry", "field": "required_artifacts",
+                                          "index": 2, "reason": "invalid_input"})
+        self.assertNotIn("sha256", diagnostic)
+        record["local_aars"] = []
+        self.pending(record)
+        original = Path.open
+        def denied(path, *args, **kwargs):
+            if path.name == "graph.json":
+                raise PermissionError("PRIVATE_SENTINEL")
+            return original(path, *args, **kwargs)
+        with patch.object(Path, "open", denied):
+            diagnostic = self.cli_diagnostic({"phase": "publication", "field": "graph",
+                                              "reason": "io_error"})
+        self.assertNotIn("sha256", diagnostic)
+        self.assertNotIn("index", diagnostic)
+
 
 class RuntimeCapture(unittest.TestCase):
+    @unittest.skipUnless(os.environ.get("GRADLE"), "Set GRADLE and JAVA_HOME for real Gradle diagnostics")
+    def test_safe_diagnostic_boundary(self):
+        with tempfile.TemporaryDirectory(prefix="runtime-diagnostic-") as temporary:
+            root = Path(temporary)
+            (root / "settings.gradle").write_text("rootProject.name='diagnostic'\ninclude ':app'\n")
+            app = root / "app"
+            (app / "libs").mkdir(parents=True)
+            (app / "build.gradle").write_text("""
+configurations { otherReleaseRuntimeClasspath; coreLibraryDesugaring }
+dependencies {
+    otherReleaseRuntimeClasspath files('libs/libbox.aar')
+    coreLibraryDesugaring files('libs/libbox.aar')
+}
+tasks.register('assembleOtherRelease') {
+    doLast {
+        configurations.otherReleaseRuntimeClasspath.files
+        configurations.coreLibraryDesugaring.files
+    }
+}
+tasks.register('signFixture') {
+    dependsOn 'captureOtherReleaseProvenance'
+    doLast { file('signed').text = 'must not run on rejection' }
+}
+""")
+            stream = io.BytesIO()
+            with zipfile.ZipFile(stream, "w") as archive:
+                for i in range(3):
+                    archive.writestr(str(i), b"safe")
+            canary = "DIAGNOSTIC_PRIVATE_SENTINEL"
+            cases = [
+                ("safe-control", b"safe", None, None),
+                ("malformed-zip", b"PK\x03\x04" + canary.encode(), "invalid_zip", None),
+                ("credential-canary", ("https://example.invalid/?token=" + canary).encode(),
+                 "credential_url", None),
+                ("budget-count", stream.getvalue(), "budget_exceeded", {"archive_members": 2}),
+            ]
+            for name, data, reason, limits in cases:
+                with self.subTest(case=name):
+                    (app / "libs/libbox.aar").write_bytes(data)
+                    (app / "signed").unlink(missing_ok=True)
+                    env = dict(os.environ)
+                    env.pop("RUNTIME_PROVENANCE_LIMITS", None)
+                    if limits:
+                        env["RUNTIME_PROVENANCE_LIMITS"] = json.dumps(limits)
+                    run = subprocess.run([
+                        os.environ["GRADLE"], "--offline", "--no-daemon", "--console=plain",
+                        "-g", str(root / "cache"), "-I", str(HERE / "runtime.init.gradle"),
+                        "-PprovenanceFixture=true", ":app:signFixture",
+                    ], cwd=root, env=env, capture_output=True, text=True, timeout=180)
+                    log = run.stdout + run.stderr
+                    self.assertNotIn(canary, log, "private sentinel leaked")
+                    graph = app / "build/runtime-provenance/graph.json"
+                    if reason is None:
+                        self.assertEqual(run.returncode, 0, "safe control failed")
+                        self.assertTrue(graph.exists())
+                        self.assertTrue((app / "signed").exists())
+                        continue
+                    self.assertNotEqual(run.returncode, 0)
+                    self.assertFalse(graph.exists())
+                    self.assertFalse((app / "signed").exists())
+                    diagnostics = [line.split("RUNTIME_DIAGNOSTIC ", 1)[1]
+                                   for line in log.splitlines() if "RUNTIME_DIAGNOSTIC " in line]
+                    self.assertEqual(len(diagnostics), 1, "bounded diagnostic absent")
+                    self.assertLessEqual(len(diagnostics[0]), 1024)
+                    diagnostic = json.loads(diagnostics[0])
+                    self.assertEqual(diagnostic["reason"], reason)
+                    self.assertEqual(diagnostic["phase"],
+                                     "raw_scan" if reason == "credential_url" else "zip_inspection")
+                    self.assertEqual(diagnostic["field"], "required_artifacts")
+                    self.assertEqual(diagnostic["index"], 0)
+                    self.assertEqual(diagnostic["sha256"], hashlib.sha256(data).hexdigest())
+                    if limits:
+                        self.assertEqual(diagnostic["budget"], "archive_members")
+                        self.assertEqual(diagnostic["count"], 3)
+                        self.assertEqual(diagnostic["limit"], 2)
+                    print(name + ": RUNTIME_DIAGNOSTIC " + diagnostics[0])
+
+            # Exercise the production Gradle boundary with a deliberately malignant child.
+            tooling = root / "tooling"
+            tooling.mkdir()
+            init = tooling / "runtime.init.gradle"
+            init.write_bytes((HERE / "runtime.init.gradle").read_bytes())
+            safe = {"schema": 1, "phase": "raw_scan", "reason": "credential_url",
+                    "field": "required_artifacts", "index": 0, "sha256": "a" * 64}
+            encoded = json.dumps(safe, separators=(",", ":"))
+            malformed = [
+                ("raw-stderr", canary),
+                ("extra-key", json.dumps(safe | {"private": canary}, separators=(",", ":"))),
+                ("invalid-enum", json.dumps(safe | {"reason": canary}, separators=(",", ":"))),
+                ("invalid-digest", json.dumps(safe | {"sha256": canary}, separators=(",", ":"))),
+                ("oversize", encoded + " " * 1024 + canary),
+                ("trailing", encoded + "\n" + canary),
+                ("duplicate-key", encoded[:-1] + ',"reason":"credential_url"}'),
+                ("integer-overflow", json.dumps(safe | {"index": 2**63}, separators=(",", ":"))),
+                ("invalid-budget", json.dumps(safe | {"reason": "budget_exceeded", "budget": canary,
+                                                      "count": 3, "limit": 2}, separators=(",", ":"))),
+                ("valid-with-private-stdout", encoded),
+            ]
+            (app / "libs/libbox.aar").write_bytes(b"safe")
+            for name, stderr in malformed:
+                with self.subTest(child=name):
+                    (tooling / "runtime_provenance.py").write_text(
+                        "import sys\n"
+                        "if sys.argv[1] == '--sanitize':\n"
+                        f"    print({canary!r})\n"
+                        f"    print({stderr!r}, file=sys.stderr)\n"
+                        "    sys.exit(1)\n")
+                    run = subprocess.run([
+                        os.environ["GRADLE"], "--offline", "--no-daemon", "--console=plain",
+                        "-g", str(root / "cache"), "-I", str(init),
+                        "-PprovenanceFixture=true", ":app:signFixture",
+                    ], cwd=root, capture_output=True, text=True, timeout=180)
+                    log = run.stdout + run.stderr
+                    self.assertNotEqual(run.returncode, 0)
+                    self.assertNotIn(canary, log, "malignant child output leaked")
+                    self.assertFalse((app / "signed").exists())
+                    self.assertFalse((app / "build/runtime-provenance/graph.json").exists())
+                    diagnostics = [line.split("RUNTIME_DIAGNOSTIC ", 1)[1]
+                                   for line in log.splitlines() if "RUNTIME_DIAGNOSTIC " in line]
+                    self.assertEqual(len(diagnostics), 1, "bounded fallback diagnostic absent")
+                    self.assertLessEqual(len(diagnostics[0]), 1024)
+                    diagnostic = json.loads(diagnostics[0])
+                    self.assertEqual(diagnostic, safe if name == "valid-with-private-stdout" else {
+                        "schema": 1, "phase": "invocation", "reason": "child_failure", "field": "capture"})
+                    print(name + ": RUNTIME_DIAGNOSTIC " + diagnostics[0])
+
     @unittest.skipUnless(os.environ.get("GRADLE"), "Set GRADLE for the real Gradle fixture")
     def test_same_resolution_and_missing_policy(self):
         with tempfile.TemporaryDirectory(prefix="runtime-fixture-") as temporary:

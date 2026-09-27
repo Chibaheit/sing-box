@@ -199,7 +199,8 @@ extracts bounded embedded LICENSE/NOTICE/COPYING/COPYRIGHT files, and creates a
 hash-indexed **android-dependency-provenance.tar.gz nested inside the existing
 source-patch-bundle.tar.gz**. Its hash is also in source-manifest.json. This keeps
 the installed workflow's exact upload allowlist and full structure unchanged;
-the manual UI handoff changes only the immutable tooling ref. No private
+the diagnostic update's manual UI handoff changes the immutable tooling ref and
+adds the explicit `test_runtime.py -v` invocation to the existing test step. No private
 workspace, signing directory, environment dump or giant SDK/cache archive is
 included. Graph paths are project-relative/redacted and URL userinfo/query
 credentials are stripped from graph labels only. Original artifact/source/metadata
@@ -259,6 +260,45 @@ These conservative defaults still require validation against the real AGP/APK
 inputs before release; synthetic AAR/JAR tests are not a full Android build.
 These limits concern this Android runtime collector only, not the separate
 recovered Go/native supplements.
+
+#### Privacy-safe rejection diagnostics
+
+Run **36302251185** completed unsigned assembly, then failed in Python `--sanitize`.
+Gradle hid the child stderr and Python discarded the rejection category. The
+offending input was not retained; neither ZIP, credential nor budget rejection
+is established as that run's cause. This change only makes a future rejection
+observable; it does not fix or certify an APK.
+
+On nonzero validator exit, Gradle logs exactly one `RUNTIME_DIAGNOSTIC` JSON
+record, accepting at most 1024 bytes of canonical JSON stderr and reserializing
+only a validated allowlisted structure. Raw stdout/stderr, exception messages,
+paths, URLs, archive member names and content are never forwarded. Malformed,
+oversize or unrecognized child diagnostics produce only `child_failure`.
+Unforeseen Python errors produce only `unexpected_error` plus safe context.
+No additional public artifact or upload path is needed.
+
+Schema 1 contains fixed `phase`, `reason` and `field` enums; known artifact
+`sha256` and zero-based `index` are optional. `required_artifacts` indexes the
+configuration artifacts in graph iteration order followed by `local_aars`;
+`supplements` indexes that separate list. Digests identify the graph's declared
+retained outer artifact (not a claim its hash check succeeded), not an inferred
+nested member or the unavailable historical CI input.
+Graph scanning reports `field: graph` without guessing an offending field/index.
+Budget failures additionally contain an allowlisted `budget`, attempted `count`
+and configured `limit`. Integers saturate at 2^63-1 for diagnostics only (that
+value means at least that amount); validation uses the original full values.
+All resource limits, URL and ZIP rules, optional omission behavior, publication
+gates and failure-before-signing behavior remain unchanged.
+
+The existing hosted test step explicitly runs runtime unit tests before tool
+setup; the two real-Gradle tests honestly skip unless `GRADLE` is configured.
+For local integration, set `GRADLE` to the existing Gradle 9.7.0 executable and
+`JAVA_HOME` to the existing JDK 17 installation, then run
+`PYTHONDONTWRITEBYTECODE=1 python3 build/android/test_runtime.py -v`.
+The synthetic offline diagnostic fixture covers distinct malformed ZIP,
+credential-canary and member-count failures, private/malformed child output,
+safe control publication and a signing stand-in that never runs on rejection.
+It does not execute AGP, Android assembly or real signing.
 
 Bundle verification must derive the exact tooling-file set from the manifest's
 tooling commit, and require the nested archive if and only if
