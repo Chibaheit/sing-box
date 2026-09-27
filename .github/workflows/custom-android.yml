@@ -1,6 +1,6 @@
 # NON-ACTIVE TEMPLATE. Render outside the repository; manually add via GitHub UI.
 # Install commit message must include [skip ci] to suppress existing push workflows.
-name: Custom Android DEBUG trial
+name: Custom Android RELEASE
 
 on:
   workflow_dispatch:
@@ -9,13 +9,14 @@ permissions:
   contents: read
 
 concurrency:
-  group: custom-android-debug-${{ github.ref }}
+  group: custom-android-release
   cancel-in-progress: false
 
 jobs:
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 180
+    environment: android-release
     env:
       PYTHONDONTWRITEBYTECODE: '1'
     steps:
@@ -23,10 +24,19 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: Chibaheit/sing-box
-          ref: '84878b7e0340059cad7ef4e25780790247cdc79f'
+          ref: '640837822b644c3e6bf22293089a0d82c74514db'
           path: tooling
           persist-credentials: false
           sparse-checkout: build/android
+
+      - name: Require protected signing inputs before setup or build
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          CERT_SHA256: ${{ secrets.CERT_SHA256 }}
+        run: python3 tooling/build/android/signing.py preflight
 
       - name: Check out paired core and Android app
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -44,9 +54,12 @@ jobs:
         run: git submodule update --init --depth 1 clients/android
 
       - name: Test source patches and artifact rejection cases
-        run: >-
-          python3 tooling/build/android/test_scripts.py
+        run: |
+          python3 -m venv "$RUNNER_TEMP/android-tooling-tests"
+          "$RUNNER_TEMP/android-tooling-tests/bin/pip" install --disable-pip-version-check PyYAML==6.0.3
+          python3 tooling/build/android/test_scripts.py \
           --core-source source --app-source source/clients/android -v
+          "$RUNNER_TEMP/android-tooling-tests/bin/python" tooling/build/android/test_release.py -v
 
       - name: Set up Go
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
@@ -75,21 +88,39 @@ jobs:
           sdkmanager 'platforms;android-37.1' 'platforms;android-36'
           'build-tools;37.0.0' 'ndk;28.0.13004108'
 
-      - name: Build arm64 libbox and OtherDebug APK
+      # Never inject signing inputs into the source-build process.
+      - name: Build arm64 libbox and unsigned OtherRelease APK
         run: bash tooling/build/android/build.sh "$GITHUB_WORKSPACE/source"
 
+      - name: Sign release with the protected owner key
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          CERT_SHA256: ${{ secrets.CERT_SHA256 }}
+        run: >-
+          bash tooling/build/android/sign.sh
+          "$GITHUB_WORKSPACE/source" "$RUNNER_TEMP/chibaheit-signed"
+
+      - name: Always remove temporary signing material
+        if: ${{ always() }}
+        run: bash tooling/build/android/sign.sh cleanup
+
       - name: Verify APK and assemble allowlisted provenance artifacts
+        env:
+          CERT_SHA256: ${{ secrets.CERT_SHA256 }}
         run: >-
           python3 tooling/build/android/collect.py
           "$GITHUB_WORKSPACE/source" "$GITHUB_WORKSPACE/tooling"
-          "$GITHUB_WORKSPACE/artifacts"
+          "$RUNNER_TEMP/chibaheit-signed" "$GITHUB_WORKSPACE/artifacts"
 
-      - name: Upload DEBUG trial and corresponding source snapshots
+      - name: Upload RELEASE and corresponding source snapshots
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: Chibaheit-SFA-1.14.1-chibaheit.1-arm64-v8a-DEBUG
+          name: Chibaheit-SFA-1.14.1-chibaheit.2-arm64-v8a-RELEASE
           path: |
-            artifacts/*-DEBUG.apk
+            artifacts/*-RELEASE.apk
             artifacts/SHA256SUMS
             artifacts/certificate-sha256.txt
             artifacts/source-manifest.json
@@ -100,4 +131,3 @@ jobs:
           include-hidden-files: false
           compression-level: 0
           retention-days: 14
-          
