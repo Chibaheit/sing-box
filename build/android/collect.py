@@ -14,6 +14,7 @@ import zipfile
 
 from prepare import HERE, MANIFEST, git, provenance, require
 from signing import expected_certificate, sdk_tools
+import runtime_provenance
 
 
 def check_apk(apk, badging):
@@ -176,6 +177,10 @@ def collect(core, tooling, signed, output):
     record["github_run_attempt"] = os.environ.get("GITHUB_RUN_ATTEMPT")
     record["actual_go_version"] = subprocess.check_output(["go", "version"], text=True).strip()
     record["actual_java_version"] = subprocess.check_output(["java", "--version"], text=True).strip()
+    # Nested in the already allowlisted patch bundle: no workflow/upload changes.
+    dependency_archive = output / "android-dependency-provenance.tar.gz"
+    record["android_runtime_provenance"] = runtime_provenance.archive(
+        app / "app/build/runtime-provenance", dependency_archive)
     (output / "source-manifest.json").write_text(json.dumps(record, indent=2) + "\n")
     with tarfile.open(output / "source-patch-bundle.tar.gz", "w:gz") as bundle:
         for name in source_files(tooling):
@@ -184,6 +189,8 @@ def collect(core, tooling, signed, output):
                 require(path.is_file() and not path.is_symlink(), "Invalid tooling source file")
                 bundle.add(path, arcname=name)
         bundle.add(output / "source-manifest.json", arcname="source-manifest.json")
+        bundle.add(dependency_archive, arcname=dependency_archive.name)
+    dependency_archive.unlink()
     archive_source(core, "core", output / "core-source.tar.gz")
     archive_source(app, "app", output / "app-source.tar.gz")
     lines = [f"{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.name}\n"
