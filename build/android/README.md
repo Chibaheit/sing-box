@@ -157,6 +157,77 @@ self-hosted runner. Only hosted Ubuntu runners are supported by the template.
 
 ## Build recipe and source evidence
 
+### Same-build Android dependency evidence
+
+`runtime.init.gradle` is an external init script, not an upstream project patch.
+`build.sh` invokes `:app:captureOtherReleaseProvenance`, which depends on
+`:app:assembleOtherRelease` in the **same Gradle invocation**, with configuration
+cache disabled. After assemble succeeds it reads that project's existing
+`otherReleaseRuntimeClasspath` and resolvable core-library-desugaring
+Configurations, not a new dependency declaration or reconstructed POM graph.
+It does not change versions, dependency locks, verification metadata, protocols,
+the five patches, versionCode **735**, or permanent signing. The previous 735 is
+unpublished; this evidence-only rebuild needs no gratuitous version bump.
+
+The required machine-readable graph contains selected components, variants,
+capabilities, edges (including conflict-selected versions), and actual artifact
+SHA-256/content-addressed copies. Local AARs are separately inventoried.
+Missing/unresolved runtime or desugaring configurations, artifacts, or local
+libbox fail before signing. Stale capture is removed at initialization.
+The capture also rejects a Configuration still in UNRESOLVED state after assemble,
+rather than silently performing a new resolution. If a future AGP consumes a
+detached copy instead, CI must fail and the hook must be adapted to that actual
+consumer; this narrow fixture does not establish AGP 9.3.1 integration.
+Supplemental Gradle POM/source queries do **not** supply the runtime graph.
+Exact-coordinate `.module` files are read from Gradle's
+`caches/modules-2/files-2.1/<group>/<module>/<version>/<hash>/` only when present;
+binary `metadata-*` indexes and whole caches are not archived.
+Unavailable POMs/modules/sources are explicit missing records, not proof of
+completeness. Gradle's public resolution API does not expose repository origin;
+this is explicitly unavailable, not inferred from repository order.
+
+Available R8 text outputs, merged native/resource/asset output hashes and
+allowlisted R8/native/resource task input hashes are retained. SDK platform and
+candidate NDK runtime inputs have separate classifications: SDK/tool installation
+does not imply incorporation. AGP directory/input coverage must be reviewed in
+the first real CI capture; absent outputs are explicit. These are input evidence,
+not an assertion every byte survives shrinking/packaging.
+
+`runtime_provenance.py` rejects absent/fixture graphs and changed artifacts,
+extracts bounded embedded LICENSE/NOTICE/COPYING/COPYRIGHT files, and creates a
+hash-indexed **android-dependency-provenance.tar.gz nested inside the existing
+source-patch-bundle.tar.gz**. Its hash is also in source-manifest.json. This keeps
+the installed workflow's exact upload allowlist and full structure unchanged;
+the manual UI handoff changes only the immutable tooling ref. No private
+workspace, signing directory, environment dump or giant SDK/cache archive is
+included. Graph paths are project-relative/redacted and URL userinfo/query
+credentials are stripped. Missing embedded notices remain explicit in the index;
+review original source notices too. This is practical publication evidence,
+not full legal certification or an infinite transitive audit.
+
+Reuse the recovered Go/native source supplements from run **36287782750**
+separately at final publication; do not redownload those large sources in CI.
+That prior APK has no recorded full runtime graph and is **not retroactively
+certified** by this change. Wuffs recovery is a separate remaining blocker.
+The next real build is needed only after review, Wuffs readiness, manual UI
+tooling-pin installation/read-back, and the user's actual GitHub approval.
+No merge, workflow installation, dispatch, release or APK change is authorized
+by this tooling preparation.
+
+Narrow integration regression (no Android SDK or full local Android build):
+
+```sh
+JAVA_HOME=/path/to/jdk17 GRADLE=/path/to/gradle-9.7.0/bin/gradle \
+  python3 build/android/test_runtime.py -v
+```
+
+This uses a synthetic HTTP Maven repository and an isolated Gradle cache to
+exercise real pinned Gradle APIs, conflict selection, edges/variants, local AARs,
+POM/module/source retrieval, cache layout, hashes, notices, tamper rejection and
+missing-graph failure. Fixture mode is marked and rejected by release collection;
+the fixture's archive-validator branch explicitly uses synthetic data, not an
+Android build result. Existing collector unit tests mock this boundary explicitly.
+
 `manifest.json` is the source/toolchain/patch-order contract. On a fresh hosted
 Ubuntu 24.04 runner (at least 8 GB RAM; public standard runners have more), the
 workflow installs Go **1.26.8**, Temurin **17**, SDK **platforms;android-37.1**
@@ -175,8 +246,9 @@ go run ./cmd/internal/build_libbox -target android -platform android/arm64
 cp libbox.aar libbox-legacy.aar clients/android/app/libs/
 cd clients/android
 ./gradlew --no-daemon --max-workers=2 \
+  --no-configuration-cache --init-script /path/to/tooling/build/android/runtime.init.gradle \
   '-Dorg.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8' \
-  -Pkotlin.compiler.execution.strategy=in-process :app:assembleOtherRelease
+  -Pkotlin.compiler.execution.strategy=in-process :app:captureOtherReleaseProvenance
 ```
 
 Use `build.sh`, not these excerpted commands alone: it validates pins, applies

@@ -45,7 +45,9 @@ cd -- "$app"
 # Never import signing properties or touch the tracked upstream release key.
 # ANDROID_HOME replaces sdk.dir; no local.properties is created.
 ./gradlew --no-daemon --max-workers=2 \
+  --no-configuration-cache --init-script "$tools/runtime.init.gradle" \
   '-Dorg.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8' \
   -Pkotlin.compiler.execution.strategy=in-process \
-  :app:assembleOtherRelease
+  :app:captureOtherReleaseProvenance
+test -s app/build/runtime-provenance/graph.json
 python3 "$tools/prepare.py" verify "$core"

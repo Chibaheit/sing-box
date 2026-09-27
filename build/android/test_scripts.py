@@ -101,6 +101,7 @@ class Patches(unittest.TestCase):
             return real_check_output(args, **kwargs)
 
         with patch("collect.provenance", return_value={"synthetic_test": True}), \
+                patch("runtime_provenance.archive", side_effect=self.synthetic_runtime_archive), \
                 patch("subprocess.check_output", side_effect=tool_output), \
                 patch("collect.sdk_tools", return_value=Path("/synthetic-sdk")), \
                 patch.dict(os.environ, {"CERT_SHA256": collect.certificate_digest(signer_report())}):
@@ -138,6 +139,7 @@ class Patches(unittest.TestCase):
                          "fb5dbd3c669af9fc236c6991e6387b7f11ff0590997f22d0f5c74ff40e04fca8")
         checksums = (output / "SHA256SUMS").read_text().splitlines()
         self.assertEqual(len(checksums), len(expected) - 1)
+
         for line in checksums:
             digest, name = line.split("  ", 1)
             self.assertEqual(digest, hashlib.sha256((output / name).read_bytes()).hexdigest())
@@ -146,6 +148,11 @@ class Patches(unittest.TestCase):
         with tarfile.open(output / "app-source.tar.gz") as bundle:
             self.assertNotIn("app/app/release.keystore", bundle.getnames())
         print("Synthetic collector test passed; no Android compilation/signing was performed")
+
+    @staticmethod
+    def synthetic_runtime_archive(capture, output):
+        output.write_bytes(b"SYNTHETIC TEST ONLY")
+        return {"synthetic_test": True}
 
     def assert_custom_sources(self):
         app = self.app
