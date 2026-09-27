@@ -217,7 +217,22 @@ are allowlisted UTF-8 source/notice text or bounded nested source archives.
 Compiled members, private keys, malformed archives, unsafe paths, symlinks,
 unknown ZIP extra fields and credential-bearing text reject the entire optional
 archive. Nothing is silently extracted/rewritten and mislabeled with its original
-archive hash. ZIP container/compressed bytes and dependency binaries are never
+archive hash. Public source ZIPs require contiguous local records in central-directory
+order, starting at byte zero and ending immediately at the directory. Prefixes,
+gaps, trailers, local/central header mismatches, encryption, ZIP64, and compression
+other than stored/DEFLATE are conservatively omitted. Both local and central extras
+allow only empty Java `0xcafe` markers, structurally valid extended timestamps
+(`0x5455`), and NTFS timestamp records (`0x000a`, zero reserved bytes, one timestamp
+attribute); unknown, duplicate or malformed extra fields are rejected. Shared
+timestamps must agree. Ordinary signed/unsigned 32-bit data descriptors are checked
+against central CRC/sizes; local CRC/sizes must match or be all zero when a descriptor
+is present. Directory entries must have zero size/CRC and either no stored payload
+or the canonical two-byte empty DEFLATE payload. File DEFLATE streams must finish
+exactly within their declared compressed extent, with no unused bytes, and decoded
+sizes/CRCs must match. This is a narrow supported-container policy, not a general
+ZIP repair/parser: unsupported optional archives are transparently omitted with
+their original digest, never normalized or published with hidden bytes.
+ZIP container/compressed bytes and dependency binaries are never
 decoded as plaintext by schema 2. Notices are extracted only from verified source
 materials; binary-container notice extraction is deliberately not attempted.
 The bounded lexical scan recognizes URL userinfo and credential query/fragment
@@ -301,12 +316,20 @@ ancestor checks. The old raw-binary scanner is reachable only through explicit
 historical schema-1 helpers, never through new capture/publication. The normal
 publisher rejects schema 1. `verify_archive` selects historical validation only
 for existing schema-1 bundles, preserving their bytes and evidence separately.
+Historical writers and bundle-verifier dispatch require an exact integer schema:
+booleans, floats, strings and unknown versions are rejected, not coerced to 1.
 
 The existing hosted test step explicitly runs runtime unit tests before tool
 setup; the two real-Gradle tests honestly skip unless `GRADLE` is configured.
 For local integration, set `GRADLE` to the existing Gradle 9.7.0 executable and
 `JAVA_HOME` to the existing JDK 17 installation, then run
 `PYTHONDONTWRITEBYTECODE=1 python3 build/android/test_runtime.py -v`.
+Also run `python3 build/android/test_runtime_v2.py -v` for the source-container
+boundary. `JAVA_HOME` enables the real Java sources-JAR control; `RETAINED_NATIVE`
+and `RETAINED_AAR` enable exact retained-byte hash-only and directory-payload
+probes (the tests verify the expected digests and sizes). These optional tests
+skip explicitly when their inputs are absent; fixture binaries are never added
+to the public provenance allowlist.
 The synthetic offline diagnostic fixture covers binary hash-only acceptance,
 private/malformed child output,
 safe control publication and a signing stand-in that never runs on rejection.

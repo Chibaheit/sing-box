@@ -2,6 +2,7 @@
 """Validate and archive explicitly captured evidence in a trusted, idle workspace."""
 import hashlib
 import codecs
+import contextlib
 import html
 import io
 import json
@@ -179,7 +180,31 @@ def scan(stream, budget, *, archive=False, collect=False, sink=None):
     return digest.hexdigest(), data, unsafe, count
 
 
-def zip_preflight(stream, budget, depth, expected=False):
+def source_extras(data, central=False):
+    fields = {}
+    while data:
+        require(len(data) >= 4, "Invalid source extra field")
+        tag, size = struct.unpack_from("<HH", data)
+        value, data = data[4:4 + size], data[4 + size:]
+        require(len(value) == size and tag not in fields, "Invalid source extra field")
+        if tag == 0xcafe:
+            require(size == 0, "Invalid Java source extra field")
+        elif tag == 0x5455:
+            require(size >= 1 and value[0] & ~7 == 0, "Invalid source timestamp flags")
+            flags = value[0] & 1 if central else value[0]
+            require(size == 1 + 4 * flags.bit_count(), "Invalid source timestamps")
+            value = {bit: stamp for bit, stamp in zip(
+                (bit for bit in (1, 2, 4) if flags & bit),
+                struct.iter_unpack("<I", value[1:]))}
+        else:
+            require(tag == 0x000a and size == 32 and
+                    value[:8] == b"\0\0\0\0\x01\0\x18\0",
+                    "Non-allowlisted source extra field")
+        fields[tag] = value
+    return fields
+
+
+def zip_preflight(stream, budget, depth, expected=False, public=False):
     def valid(condition):
         if not condition:
             raise UnsafeEvidence("Invalid or unsupported ZIP evidence", "invalid_zip")
@@ -215,6 +240,7 @@ def zip_preflight(stream, budget, depth, expected=False):
     # Count actual records without allocating ZipInfo objects or trusting the EOCD count.
     position = offset
     actual = 0
+    local_end = 0
     while position < eocd:
         valid(eocd - position >= 46)
         stream.seek(position)
@@ -235,16 +261,83 @@ def zip_preflight(stream, budget, depth, expected=False):
             valid(field != 1 and field_size <= remaining - 4)
             stream.seek(field_size, os.SEEK_CUR)
             remaining -= 4 + field_size
+        if public:
+            valid(local == local_end and local + 30 <= offset)
+            version, flags, method, time, date, crc = struct.unpack_from("<5HI", header, 6)
+            valid(version in (10, 20) and method in (0, 8) and flags & ~0x080e == 0)
+            valid(method == 8 or flags & 6 == 0)
+            budget.check("member_bytes", uncompressed)
+            stream.seek(position + 46)
+            central_name = stream.read(name)
+            central_extra = source_extras(stream.read(extra), central=True)
+            stream.seek(local)
+            local_header = stream.read(30)
+            valid(local_header[:4] == b"PK\x03\x04" and local_header[4:14] == header[6:16])
+            local_crc, local_compressed, local_size, local_name, local_extra_size = struct.unpack_from(
+                "<3I2H", local_header, 14)
+            valid(local + 30 + local_name + local_extra_size + compressed <= offset)
+            valid(local_name == name and stream.read(local_name) == central_name)
+            local_extra = source_extras(stream.read(local_extra_size))
+            for tag in central_extra.keys() & local_extra.keys():
+                left, right = central_extra[tag], local_extra[tag]
+                if tag == 0x5455:
+                    valid(all(left[bit] == right[bit] for bit in left.keys() & right.keys()))
+                else:
+                    valid(left == right)
+            values = (crc, compressed, uncompressed)
+            local_values = (local_crc, local_compressed, local_size)
+            valid(local_values == values or (flags & 8 and local_values == (0, 0, 0)))
+            payload = stream.tell()
+            local_end = payload + compressed
+            if central_name.endswith(b"/"):
+                valid(uncompressed == crc == 0)
+                valid((method == 0 and compressed == 0) or
+                      (method == 8 and compressed == 2 and stream.read(2) == b"\x03\x00"))
+            if flags & 8:
+                stream.seek(local_end)
+                first = stream.read(4)
+                signed = first == b"PK\x07\x08"
+                descriptor = stream.read(12) if signed else first + stream.read(8)
+                valid(len(descriptor) == 12 and struct.unpack("<3I", descriptor) == values)
+                local_end += 16 if signed else 12
+                valid(local_end <= offset)
         actual += 1
         budget.check("archive_members", actual)
         budget.add("capture_members", 1)
         position = following
     valid(actual == count)
+    if public:
+        valid(local_end == offset)
     return actual
 
 
+def source_chunks(stream, member):
+    """Consume exactly one stored/DEFLATE payload; ZipExtFile permits unused compressed bytes."""
+    stream.seek(member.header_offset + 26)
+    name, extra = struct.unpack("<HH", stream.read(4))
+    stream.seek(name + extra, os.SEEK_CUR)
+    remaining = member.compress_size
+    decoder = zlib.decompressobj(-15) if member.compress_type == zipfile.ZIP_DEFLATED else None
+    crc = 0
+    while remaining:
+        encoded = stream.read(min(65536, remaining))
+        require(bool(encoded), "Truncated source payload")
+        remaining -= len(encoded)
+        while encoded:
+            if decoder:
+                data = decoder.decompress(encoded, 65536)
+                require(not decoder.unused_data, "Unaccounted compressed source bytes")
+                encoded = decoder.unconsumed_tail
+            else:
+                data, encoded = encoded, b""
+            crc = zlib.crc32(data, crc)
+            yield data
+    require(decoder is None or decoder.eof, "Truncated compressed source payload")
+    require(crc == member.CRC, "Invalid source payload CRC")
+
+
 def inspect_zip(stream, budget, depth=1, prefix="", expected=False, public=False):
-    count = zip_preflight(stream, budget, depth, expected)
+    count = zip_preflight(stream, budget, depth, expected, public)
     notices = []
     unsafe = None
     if count is not None:
@@ -273,16 +366,6 @@ def inspect_zip(stream, budget, depth=1, prefix="", expected=False, public=False
                     require(Path(member.filename).suffix.lower() not in
                             {".aar", ".class", ".so", ".a", ".o", ".dex", ".exe", ".dll"},
                             "Compiled source member")
-                    extra = member.extra
-                    while extra:
-                        require(len(extra) >= 4, "Invalid source extra field")
-                        tag, length = struct.unpack_from("<HH", extra)
-                        require(length <= len(extra) - 4 and
-                                ((tag == 0xcafe and length == 0) or
-                                 (tag == 0x5455 and length in (1, 5, 9, 13)) or
-                                 (tag == 0x000a and length == 32)),
-                                "Non-allowlisted source extra field")
-                        extra = extra[4 + length:]
                 budget.check("member_bytes", member.file_size)
                 try:
                     check_urls(member.filename)
@@ -295,11 +378,12 @@ def inspect_zip(stream, budget, depth=1, prefix="", expected=False, public=False
                 if notice:
                     budget.check("notice_member_bytes", member.file_size)
                     budget.add("notice_bytes", member.file_size)
-                with tempfile.TemporaryFile() as nested, source.open(member) as member_stream:
+                with tempfile.TemporaryFile() as nested, (
+                        contextlib.nullcontext() if public else source.open(member)) as member_stream:
                     if public:
                         member_hash = hashlib.sha256()
                         count = 0
-                        while chunk := member_stream.read(65536):
+                        for chunk in source_chunks(stream, member):
                             count += len(chunk)
                             budget.check("member_bytes", count)
                             budget.add("capture_bytes", len(chunk))
@@ -451,7 +535,7 @@ def archive_legacy(capture, output):
     require(not output.exists(), "Runtime archive output already exists")
     budget = Budget()
     capture, graph, record = load_capture(capture, budget)
-    require(record["schema"] == 1 and record["mode"] == "build",
+    require(type(record["schema"]) is int and record["schema"] == 1 and record["mode"] == "build",
             "Fixture graph is not build evidence")
     require(record["assemble_task"] == ":app:assembleOtherRelease", "Wrong captured variant")
     configurations = record["configurations"]

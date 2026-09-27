@@ -130,6 +130,17 @@ class RuntimeSafety(unittest.TestCase):
         (self.capture / "graph.json").write_text(json.dumps(record))
         self.rejected("credential")
 
+    def test_legacy_schema_requires_exact_integer(self):
+        for schema in (True, False, 1.0, "1", None):
+            record, _ = self.evidence(b"ordinary")
+            record["schema"] = schema
+            (self.capture / "graph.json").write_text(json.dumps(record))
+            with self.subTest(schema=schema):
+                try:
+                    self.rejected("build evidence")
+                finally:
+                    self.output.unlink(missing_ok=True)
+
     def test_prepare_does_not_follow_symlinks_or_remove_unowned_files(self):
         self.evidence(b"ordinary")
         (self.capture / "keep").write_bytes(b"owned by someone else")
