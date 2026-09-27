@@ -12,7 +12,8 @@
     "patches": [
       "patches/app/0001-build-identity.patch",
       "patches/app/0002-disable-upstream-updates.patch",
-      "patches/app/0003-vpn-protection.patch"
+      "patches/app/0003-vpn-protection.patch",
+      "patches/app/0004-pinned-libbox-api.patch"
     ],
     "upstream_version": "1.14.1",
     "version_name": "1.14.1-chibaheit.1",
