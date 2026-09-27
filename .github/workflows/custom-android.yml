@@ -24,7 +24,7 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: Chibaheit/sing-box
-          ref: 'c208d39d1c9949625810833d8a2e0806727b4a95'
+          ref: '16310d4fcc88470464519690ce10c3abc0e46957'
           path: tooling
           persist-credentials: false
           sparse-checkout: build/android
@@ -61,6 +61,7 @@ jobs:
           --core-source source --app-source source/clients/android -v
           "$RUNNER_TEMP/android-tooling-tests/bin/python" tooling/build/android/test_release.py -v
           python3 tooling/build/android/test_runtime.py -v
+          python3 tooling/build/android/test_runtime_v2.py -v
 
       - name: Set up Go
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
