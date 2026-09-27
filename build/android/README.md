@@ -204,7 +204,8 @@ workspace, signing directory, environment dump or giant SDK/cache archive is
 included. Graph paths are project-relative/redacted and URL userinfo/query
 credentials are stripped from graph labels only. Original artifact/source/metadata
 bytes are never rewritten: a shared Python validator scans retained raw evidence
-and ZIP members before publishing the Gradle graph. Optional POM/module/source/R8
+and ZIP members, recursively including AAR `classes.jar` and nested source JARs,
+before publishing the Gradle graph. Optional POM/module/source/R8
 evidence containing credential URLs is omitted with an explicit nonsecret reason
 and the SHA-256 of its original bytes. Required evidence fails with a sanitized
 error instead. The archive validator independently rescans all public leaves,
@@ -214,6 +215,11 @@ keys (including percent-encoded keys, camelCase, HTML entities, JSON ASCII escap
 and UTF-16 ASCII text). Ordinary source variable names such as `token` and safe
 URLs are not redacted or modified. This is not a general secret classifier or a
 decoder for arbitrarily obfuscated/encrypted source.
+Uninspectable nested ZIP evidence is not certified: malformed/unsupported ZIPs
+or nested inspection limits abort required evidence or omit optional evidence
+with its original SHA-256 and a sanitized reason. Nested `.zip`/`.jar`/`.aar`
+members must be inspectable ZIPs. Notices inside nested archives use `!/` between
+archive/member names in the index; original archive bytes remain unchanged.
 
 Capture root, referenced files, reserved notice/index paths and archive output
 must have no symlink ancestors, including the final path. Checks precede reads
@@ -228,15 +234,29 @@ Limits apply to each ZIP and the overall capture, including declared sizes,
 actual streamed bytes and duplicate-member work. Defaults: 100,000 members per
 archive / 500,000 per capture; 128 MiB per member; 512 MiB expanded per archive;
 2 GiB total scanned bytes (raw files plus expanded members); 2 GiB retained raw
-evidence; 1 MiB per notice / 32 MiB total notices; 32 MiB graph. Oversize notices
+evidence; 1 MiB per notice / 32 MiB total notices; 32 MiB graph. ZIP nesting is
+limited to 8 archive levels (the outer archive is level 1). Central-directory
+bytes are capped at 16 MiB per ZIP / 64 MiB across the capture, before `ZipFile`
+can allocate directory entries. A bounded precheck checks the EOCD and actual
+central-directory record count/lengths, not just the declared count. ZIP64,
+multidisk, noncontiguous directories and malformed directory layouts are rejected
+rather than parsed permissively. Ordinary ZIP comments and data descriptors work.
+Nested members are streamed to anonymous temporary files, not accumulated in
+memory; directory allocations and notice retention are bounded by the shared
+capture limits. Expanded bytes, members, directory bytes and notices are charged
+across all nesting levels and siblings, never reset per nested archive. Temporary
+disk use is also bounded by the streamed byte limits. Oversize required notices
 and archives fail, rather than being partially published. Original source JARs
 can be much larger than notices. A bounded URL scan rejects URLs of 64 KiB or
 longer. Reads use 64 KiB chunks; a failing read can exceed a byte limit by at most
 one chunk. Override positive integer limits explicitly with
 `RUNTIME_PROVENANCE_LIMITS`, a JSON object using keys `archive_members`,
 `capture_members`, `member_bytes`, `archive_bytes`, `capture_bytes`,
-`evidence_bytes`, `notice_member_bytes`, `notice_bytes`, `graph_bytes`.
+`evidence_bytes`, `notice_member_bytes`, `notice_bytes`, `graph_bytes`,
+`archive_depth`, `archive_directory_bytes`, `capture_directory_bytes`.
 Use the same reviewed settings for Gradle capture and release collection.
+These conservative defaults still require validation against the real AGP/APK
+inputs before release; synthetic AAR/JAR tests are not a full Android build.
 These limits concern this Android runtime collector only, not the separate
 recovered Go/native supplements.
 

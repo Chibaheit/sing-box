@@ -7,6 +7,7 @@ import io
 import json
 import os
 from pathlib import Path
+import struct
 import subprocess
 import tempfile
 import tarfile
@@ -186,6 +187,194 @@ class RuntimeSafety(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "already exists"):
             runtime_provenance.archive(self.capture, self.output)
         self.assertEqual(self.output.read_bytes(), b"prior evidence")
+
+    def nested_sources(self):
+        return self.zipped([("sources.jar", self.zipped([
+            ("Example.java", b"// https://example.invalid/?token=INDEPENDENT_SYNTHETIC_CANARY")
+        ]))])
+
+    def pending(self, record):
+        runtime_provenance.prepare_capture(self.capture)
+        (self.capture / "graph.pending.json").write_text(json.dumps(record))
+
+    def optional(self, data):
+        record, _ = self.evidence(b"safe runtime")
+        digest = hashlib.sha256(data).hexdigest()
+        entry = {"file": f"files/{digest}", "sha256": digest, "kind": "sources"}
+        (self.capture / entry["file"]).write_bytes(data)
+        record["supplements"].append(entry)
+        return record, entry
+
+    def test_nested_credentials_required(self):
+        record, _ = self.evidence(self.nested_sources())
+        self.pending(record)
+        with self.assertRaisesRegex(ValueError, "credential-bearing URL") as raised:
+            runtime_provenance.sanitize_capture(self.capture)
+        self.assertNotIn("INDEPENDENT_SYNTHETIC_CANARY", str(raised.exception))
+        self.assertFalse((self.capture / "graph.json").exists())
+        self.assertFalse(self.output.exists())
+
+    def test_nested_credentials_optional(self):
+        record, entry = self.optional(self.nested_sources())
+        self.pending(record)
+        runtime_provenance.sanitize_capture(self.capture)
+        sanitized = json.loads((self.capture / "graph.json").read_text())
+        self.assertEqual(sanitized["supplements"], [])
+        self.assertEqual(sanitized["supplemental_missing"], [{
+            "component": None, "kind": "sources", "sha256": entry["sha256"],
+            "reason": "credential-bearing URL"}])
+        runtime_provenance.archive(self.capture, self.output)
+        with tarfile.open(self.output) as bundle:
+            self.assertNotIn(entry["file"], bundle.getnames())
+
+    def assert_preflight_rejects(self, data, limits, message, expected_objects=0):
+        self.output.unlink(missing_ok=True)
+        _, entry = self.evidence(data)
+        created = []
+        original = zipfile.ZipInfo.__init__
+        def counted(instance, *args, **kwargs):
+            created.append(1)
+            original(instance, *args, **kwargs)
+        with patch.dict(os.environ, {"RUNTIME_PROVENANCE_LIMITS": json.dumps(limits)}), \
+                patch.object(zipfile.ZipInfo, "__init__", counted):
+            with self.assertRaisesRegex(ValueError, message):
+                runtime_provenance.archive(self.capture, self.output)
+        self.assertEqual(len(created), expected_objects)
+        self.assertFalse(self.output.exists())
+        self.assertEqual(hashlib.sha256(data).hexdigest(), entry["sha256"])
+
+    def test_directory_preallocation_exact_review(self):
+        data = self.zipped([(str(i), b"") for i in range(5000)])
+        self.assertEqual(len(data), 427802)
+        self.assert_preflight_rejects(data, {"archive_members": 2}, "archive_members")
+
+    def test_directory_count_mismatch(self):
+        data = self.zipped([(str(i), b"") for i in range(5000)])
+        spoofed = bytearray(data)
+        struct.pack_into("<HH", spoofed, len(spoofed) - 22 + 8, 1, 1)
+        self.assert_preflight_rejects(bytes(spoofed), {"archive_members": 2}, "ZIP|limit")
+        for count in (0, 2):
+            data = bytearray(self.zipped([("one", b"")]))
+            struct.pack_into("<HH", data, len(data) - 22 + 8, count, count)
+            self.assert_preflight_rejects(bytes(data), {}, "ZIP")
+
+    def test_directory_bytes_before_allocation(self):
+        data = self.zipped([("long/" * 1000, b"")])
+        self.assert_preflight_rejects(data, {"archive_directory_bytes": 128},
+                                     "archive_directory_bytes")
+        self.assert_preflight_rejects(data, {"capture_directory_bytes": 128},
+                                     "capture_directory_bytes")
+
+    def test_unsupported_and_malformed_zip(self):
+        normal = self.zipped([("one", b"")])
+        mutations = []
+        for offset, fmt, value in ((4, "<H", 1), (6, "<H", 1), (8, "<H", 0xffff),
+                                   (12, "<I", 0xffffffff), (16, "<I", 0xffffffff),
+                                   (20, "<H", 1)):
+            data = bytearray(normal)
+            struct.pack_into(fmt, data, len(data) - 22 + offset, value)
+            mutations.append(bytes(data))
+        data = bytearray(normal)
+        central = data.index(b"PK\x01\x02")
+        struct.pack_into("<H", data, central + 28, 0xffff)
+        mutations.extend((bytes(data), normal[:-22], b"PK\x03\x04malformed"))
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            info = zipfile.ZipInfo("zip64")
+            info.extra = struct.pack("<HHQQ", 1, 16, 0, 0)
+            archive.writestr(info, b"")
+        mutations.append(buffer.getvalue())
+        mutations.append(normal[:-22] + b"PK\x06\x07" + bytes(16) + normal[-22:])
+        for data in mutations:
+            with self.subTest(case=len(data)):
+                self.assert_preflight_rejects(data, {}, "ZIP")
+
+    def test_nested_preflight_and_shared_limits(self):
+        jar = self.zipped([("one", b""), ("two", b""), ("three", b"")])
+        data = self.zipped([("classes.jar", jar)])
+        self.assert_preflight_rejects(data, {"archive_members": 2}, "archive_members", 1)
+        jar = self.zipped([("long/" * 1000, b"")])
+        data = self.zipped([("classes.jar", jar)])
+        self.assert_preflight_rejects(data, {"archive_directory_bytes": 128},
+                                     "archive_directory_bytes", 1)
+        jar = self.zipped([("Example.java", b"x" * 1024)])
+        data = self.zipped([("one.jar", jar), ("two.jar", jar)])
+        for limits, message in (({"capture_members": 3}, "capture_members"),
+                                ({"member_bytes": 512}, "member_bytes"),
+                                ({"archive_bytes": 512}, "archive_bytes"),
+                                ({"capture_bytes": len(data) + 2 * len(jar) + 1024},
+                                 "capture_bytes"),
+                                ({"capture_directory_bytes": 200},
+                                 "capture_directory_bytes")):
+            with self.subTest(limits=limits):
+                self.evidence(data)
+                with patch.dict(os.environ, {"RUNTIME_PROVENANCE_LIMITS": json.dumps(limits)}):
+                    self.rejected(message)
+        data = self.zipped([("one.jar", self.zipped([("LICENSE", b"a" * 1024)])),
+                            ("two.jar", self.zipped([("NOTICE", b"b" * 1024)]))])
+        self.evidence(data)
+        with patch.dict(os.environ, {"RUNTIME_PROVENANCE_LIMITS": '{"notice_bytes":1536}'}):
+            self.rejected("notice_bytes")
+
+    def test_nested_depth_and_optional_uninspectable(self):
+        data = self.zipped([("Example.java", b"ordinary source")])
+        for _ in range(3):
+            data = self.zipped([("nested.jar", data)])
+        _, entry = self.evidence(data)
+        with patch.dict(os.environ, {"RUNTIME_PROVENANCE_LIMITS": '{"archive_depth":4}'}):
+            _, _, unsafe = runtime_provenance.inspect(
+                self.capture / entry["file"], runtime_provenance.Budget())
+            self.assertIsNone(unsafe)
+        self.evidence(data)
+        with patch.dict(os.environ, {"RUNTIME_PROVENANCE_LIMITS": '{"archive_depth":3}'}):
+            self.rejected("archive_depth")
+        deep = data
+        for _ in range(5):
+            deep = self.zipped([("nested.jar", deep)])
+        self.evidence(deep)
+        self.rejected("archive_depth")
+        for data in (data, self.zipped([("sources.jar", b"PK\x03\x04broken")])):
+            record, entry = self.optional(data)
+            self.pending(record)
+            with patch.dict(os.environ, {"RUNTIME_PROVENANCE_LIMITS": '{"archive_depth":3}'}):
+                runtime_provenance.sanitize_capture(self.capture)
+            sanitized = json.loads((self.capture / "graph.json").read_text())
+            self.assertEqual(sanitized["supplements"], [])
+            self.assertEqual(sanitized["supplemental_missing"][0]["sha256"], entry["sha256"])
+            self.assertRegex(sanitized["supplemental_missing"][0]["reason"], "ZIP|archive_depth")
+
+    def test_normal_zip_comments_empty_and_data_descriptors(self):
+        class Unseekable(io.BytesIO):
+            def seek(self, *args):
+                raise OSError("unseekable fixture")
+        stream = Unseekable()
+        with zipfile.ZipFile(stream, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.comment = b"ordinary archive comment"
+            archive.writestr("Example.java", b"class Example {}")
+        for data in (stream.getvalue(), self.zipped([])):
+            _, entry = self.evidence(data)
+            digest, _, unsafe = runtime_provenance.inspect(
+                self.capture / entry["file"], runtime_provenance.Budget())
+            self.assertEqual(digest, entry["sha256"])
+            self.assertIsNone(unsafe)
+
+    def test_safe_aar_classes_and_source_jars_unchanged(self):
+        classes = self.zipped([("example/Example.class", b"\xca\xfe\xba\xbe"),
+                               ("META-INF/LICENSE", b"nested license")])
+        sources = self.zipped([("example/Example.java",
+                               b"// https://example.invalid/?page=2\nclass Example {}")])
+        data = self.zipped([("AndroidManifest.xml", b"<manifest/>"),
+                            ("classes.jar", classes), ("libs/sources.jar", sources)])
+        record, entry = self.evidence(data)
+        self.pending(record)
+        runtime_provenance.sanitize_capture(self.capture)
+        runtime_provenance.archive(self.capture, self.output)
+        with tarfile.open(self.output) as bundle:
+            self.assertEqual(bundle.extractfile(entry["file"]).read(), data)
+            index = json.load(bundle.extractfile("index.json"))
+            self.assertEqual(index["files"][entry["file"]], hashlib.sha256(data).hexdigest())
+            self.assertEqual(len(index["notices"]), 1)
+            self.assertEqual(index["notices"][0]["member"], "classes.jar!/META-INF/LICENSE")
 
 
 class RuntimeCapture(unittest.TestCase):

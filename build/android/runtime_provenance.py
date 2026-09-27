@@ -7,11 +7,13 @@ import json
 import os
 from pathlib import Path
 import re
+import struct
 import sys
 import tarfile
 import tempfile
 from urllib.parse import unquote, urlsplit
 import zipfile
+import zlib
 
 from prepare import require
 
@@ -22,6 +24,8 @@ DEFAULT_LIMITS = {
     "capture_bytes": 2 * 1024**3, "evidence_bytes": 2 * 1024**3,
     "notice_member_bytes": 1024**2, "notice_bytes": 32 * 1024**2,
     "graph_bytes": 32 * 1024**2,
+    "archive_depth": 8, "archive_directory_bytes": 16 * 1024**2,
+    "capture_directory_bytes": 64 * 1024**2,
 }
 URL = re.compile(r"(?<![a-z0-9+.-])[a-z][a-z0-9+.-]*://[^\s<>\"'`\\]+", re.I | re.ASCII)
 SECRET_KEY = re.compile(
@@ -61,7 +65,8 @@ class Budget:
         self.used = {}
 
     def check(self, key, count):
-        require(count <= self.limits[key], "Runtime evidence limit exceeded: " + key)
+        if count > self.limits[key]:
+            raise EvidenceLimit("Runtime evidence limit exceeded: " + key)
 
     def add(self, key, count):
         self.used[key] = self.used.get(key, 0) + count
@@ -69,6 +74,10 @@ class Budget:
 
 
 class UnsafeEvidence(ValueError):
+    pass
+
+
+class EvidenceLimit(ValueError):
     pass
 
 
@@ -93,7 +102,7 @@ def check_urls(text):
     return text
 
 
-def scan(stream, budget, *, archive=False, collect=False):
+def scan(stream, budget, *, archive=False, collect=False, sink=None):
     digest = hashlib.sha256()
     tail = ""
     data = bytearray() if collect else None
@@ -113,26 +122,85 @@ def scan(stream, budget, *, archive=False, collect=False):
         tail = text[-65536:]
         if collect:
             data.extend(chunk)
+        if sink is not None:
+            sink.write(chunk)
     return digest.hexdigest(), data, unsafe, count
 
 
-def inspect(path, budget):
-    try:
-        return inspect_evidence(path, budget)
-    except (zipfile.BadZipFile, NotImplementedError, RuntimeError):
-        raise ValueError("Invalid or unsupported ZIP evidence") from None
+def zip_preflight(stream, budget, depth, expected=False):
+    def valid(condition):
+        if not condition:
+            raise UnsafeEvidence("Invalid or unsupported ZIP evidence")
+
+    stream.seek(0, os.SEEK_END)
+    length = stream.tell()
+    stream.seek(0)
+    magic = stream.read(4)
+    tail_start = max(0, length - 65557)
+    stream.seek(tail_start)
+    tail = stream.read(65557)
+    end = tail.rfind(b"PK\x05\x06")
+    if end < 0:
+        valid(not expected and magic not in (b"PK\x03\x04", b"PK\x05\x06",
+                                            b"PK\x07\x08", b"PK\x06\x06"))
+        return None
+    valid(len(tail) - end >= 22)
+    _, disk, directory_disk, disk_count, count, size, offset, comment = struct.unpack_from(
+        "<4s4H2IH", tail, end)
+    eocd = tail_start + end
+    valid(end + 22 + comment == len(tail))
+    valid(disk == directory_disk == 0 and disk_count == count)
+    valid(count != 0xffff and size != 0xffffffff and offset != 0xffffffff)
+    valid(offset + size == eocd and count * 46 <= size)
+    if eocd >= 20:
+        stream.seek(eocd - 20)
+        valid(stream.read(4) != b"PK\x06\x07")
+    budget.check("archive_depth", depth)
+    budget.check("archive_members", count)
+    budget.check("capture_members", budget.used.get("capture_members", 0) + count)
+    budget.check("archive_directory_bytes", size)
+    budget.add("capture_directory_bytes", size)
+    # Count actual records without allocating ZipInfo objects or trusting the EOCD count.
+    position = offset
+    actual = 0
+    while position < eocd:
+        valid(eocd - position >= 46)
+        stream.seek(position)
+        header = stream.read(46)
+        valid(len(header) == 46 and header[:4] == b"PK\x01\x02")
+        compressed, uncompressed = struct.unpack_from("<II", header, 20)
+        name, extra, note, start_disk = struct.unpack_from("<4H", header, 28)
+        local = struct.unpack_from("<I", header, 42)[0]
+        valid(start_disk == 0 and 0xffffffff not in (compressed, uncompressed, local))
+        valid(local < offset)
+        following = position + 46 + name + extra + note
+        valid(following <= eocd)
+        stream.seek(position + 46 + name)
+        remaining = extra
+        while remaining:
+            valid(remaining >= 4)
+            field, field_size = struct.unpack("<HH", stream.read(4))
+            valid(field != 1 and field_size <= remaining - 4)
+            stream.seek(field_size, os.SEEK_CUR)
+            remaining -= 4 + field_size
+        actual += 1
+        budget.check("archive_members", actual)
+        budget.add("capture_members", 1)
+        position = following
+    valid(actual == count)
+    return actual
 
 
-def inspect_evidence(path, budget):
-    budget.add("evidence_bytes", path.stat().st_size)
-    with path.open("rb") as stream:
-        digest, _, unsafe, _ = scan(stream, budget)
+def inspect_zip(stream, budget, depth=1, prefix="", expected=False):
+    count = zip_preflight(stream, budget, depth, expected)
     notices = []
-    if zipfile.is_zipfile(path):
-        with zipfile.ZipFile(path) as source:
+    unsafe = None
+    if count is not None:
+        stream.seek(0)
+        with zipfile.ZipFile(stream) as source:
             members = source.infolist()
+            require(len(members) == count, "Invalid ZIP directory count")
             budget.check("archive_members", len(members))
-            budget.add("capture_members", len(members))
             budget.check("archive_bytes", sum(m.file_size for m in members))
             budget.check("capture_bytes", budget.used.get("capture_bytes", 0) +
                          sum(m.file_size for m in members))
@@ -150,15 +218,34 @@ def inspect_evidence(path, budget):
                 if notice:
                     budget.check("notice_member_bytes", member.file_size)
                     budget.add("notice_bytes", member.file_size)
-                with source.open(member) as stream:
+                with tempfile.TemporaryFile() as nested, source.open(member) as member_stream:
                     member_hash, data, problem, count = scan(
-                        stream, budget, archive=True, collect=notice)
-                require(count == member.file_size, "Invalid archive member size")
+                        member_stream, budget, archive=True, collect=notice, sink=nested)
+                    require(count == member.file_size, "Invalid archive member size")
+                    embedded, nested_problem = inspect_zip(
+                        nested, budget, depth + 1, prefix + member.filename + "!/",
+                        Path(member.filename).suffix.lower() in {".zip", ".jar", ".aar"})
+                    notices.extend(embedded)
+                    unsafe = unsafe or nested_problem
                 actual += count
                 budget.check("archive_bytes", actual)
                 unsafe = unsafe or problem
                 if notice:
-                    notices.append((member.filename, member_hash, bytes(data)))
+                    notices.append((prefix + member.filename, member_hash, bytes(data)))
+    return notices, unsafe
+
+
+def inspect(path, budget):
+    budget.add("evidence_bytes", path.stat().st_size)
+    with path.open("rb") as stream:
+        digest, _, unsafe, _ = scan(stream, budget)
+        try:
+            notices, problem = inspect_zip(stream, budget)
+            unsafe = unsafe or problem
+        except (UnsafeEvidence, EvidenceLimit) as problem:
+            notices, unsafe = [], unsafe or UnsafeEvidence(str(problem))
+        except (zipfile.BadZipFile, NotImplementedError, RuntimeError, EOFError, zlib.error):
+            notices, unsafe = [], UnsafeEvidence("Invalid or unsupported ZIP evidence")
     return digest, notices, unsafe
 
 
